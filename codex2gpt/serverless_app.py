@@ -587,28 +587,27 @@ def auth_accounts(request: Request):
     reject = _require_dashboard(request)
     if reject is not None:
         return reject
-    accounts = []
-    for account in STATE_DB.list_accounts():
-        item = dict(account)
-        item["proxy_mode"] = "global"
-        item["proxy_assignment"] = None
-        item["is_codex_app_current"] = False
-        item["is_codex_app_reserved"] = False
-        accounts.append(item)
-    return {
-        "data": accounts,
-        "codex_app": {
-            "matched": False,
-            "current_entry_id": "",
-            "current_account_id": "",
-            "current_identity_key": "",
-            "auth_path": os.environ.get("LITE_CODEX_AUTH_PATH", "~/.codex/auth.json"),
-            "external_override_detected": False,
-        },
-        "warnings": [],
-        "proxy_assignments": [],
-        "quota_refresh": None,
-    }
+    try:
+        _sync_db_accounts_to_legacy_runtime()
+    except Exception:
+        pass
+    try:
+        _mirror_session_to_legacy(request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(), _client_ip(request))
+    except Exception:
+        pass
+    full_path = "/auth/accounts"
+    query = request.url.query
+    if query:
+        full_path = f"{full_path}?{query}"
+    bridge = _LegacyBridgeHandler("GET", full_path, dict(request.headers), b"", _client_ip(request))
+    bridge.do_GET()
+    passthrough_headers: dict[str, str] = {}
+    for key, value in bridge.response_headers:
+        low = key.lower()
+        if low in {"content-length", "connection", "transfer-encoding"}:
+            continue
+        passthrough_headers.setdefault(key, value)
+    return Response(content=bridge.response_body, status_code=bridge.response_status, headers=passthrough_headers)
 
 
 @app.post("/auth/login-start")

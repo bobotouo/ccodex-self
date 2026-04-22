@@ -1035,7 +1035,6 @@ function renderAccountFilters(accountsPayload) {
 }
 
 function renderAccounts(accountsPayload) {
-  renderCodexAppCard(accountsPayload);
   renderAccountFilters(accountsPayload);
   const accounts = accountsPayload.data || [];
   const warningsByAccount = new Set((accountsPayload.warnings || []).map((item) => item.account_id));
@@ -1084,15 +1083,6 @@ function renderAccounts(accountsPayload) {
               <span class="soft-pill">${escapeHtml(t("accounts.proxyMode", { value: proxyMode }))}</span>
               <span class="soft-pill">${escapeHtml(t("accounts.assignedProxy", { value: proxyAssignment }))}</span>
               <span class="muted">${escapeHtml(t("common.updated"))} ${escapeHtml(formatDateTime(account.updated_at))}</span>
-            </div>
-
-            <div class="meta-row">
-              <button
-                class="action secondary"
-                type="button"
-                data-codex-app-select="${escapeHtml(account.entry_id)}"
-                ${account.is_codex_app_current ? "disabled" : ""}
-              >${account.is_codex_app_current ? escapeHtml(t("accounts.currentCodexButton")) : escapeHtml(t("accounts.setCodexButton"))}</button>
             </div>
 
             <div class="metric-grid">
