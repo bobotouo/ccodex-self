@@ -3,6 +3,7 @@ const endpoints = {
   runtime: "/admin/runtime-status",
   rotation: "/admin/rotation-settings",
   usage: "/admin/usage-stats/summary",
+  apiKeys: "/admin/api-keys",
   accounts: "/auth/accounts?quota=fresh",
   proxies: "/api/proxies",
   relays: "/api/relay-providers",
@@ -550,6 +551,19 @@ async function postJson(url, payload = {}) {
   }
 }
 
+async function deleteJson(url) {
+  const response = await fetch(url, {
+    method: "DELETE",
+    credentials: "same-origin",
+  });
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: response.ok, status: response.status, error: text || `HTTP ${response.status}` };
+  }
+}
+
 function prettyJson(value) {
   return JSON.stringify(value, null, 2);
 }
@@ -814,6 +828,8 @@ function applySummary(status, runtime, usage, accountsPayload, proxiesPayload, r
     [t("status.accounts"), `${summary.accounts || 0}`],
     [t("status.proxies"), `${summary.proxies || 0}`],
     [t("status.relayProviders"), `${summary.relay_providers || 0}`],
+    ["Managed API Keys", `${status.managed_api_keys || 0}`],
+    ["API Key Required", status.api_key_required ? t("common.yes") : t("common.no")],
     [t("status.usageDataPoints"), `${usage.data_points || 0}`],
     [t("status.backgroundJobs"), Object.keys(summary.background_jobs || {}).length ? Object.keys(summary.background_jobs).join(", ") : t("status.noneRegistered")],
   ];
@@ -1299,6 +1315,37 @@ function renderRelays(relaysPayload) {
   );
 }
 
+function renderApiKeys(apiKeysPayload) {
+  const items = apiKeysPayload?.data || [];
+  if (!items.length) {
+    setHtml("#api-key-list", renderEmpty("暂无 API Key。创建后将自动启用鉴权。"));
+    return;
+  }
+  setHtml(
+    "#api-key-list",
+    items
+      .map(
+        (item) => `
+          <article class="list-item">
+            <div class="badge-row">
+              ${renderBadge(item.name || item.key_id, item.enabled ? "enabled" : "disabled", item.enabled ? "good" : "warn")}
+              ${renderBadge("Requests", formatNumber(item.request_count || 0), "")}
+            </div>
+            <strong>${escapeHtml(item.key_prefix || "")}…</strong>
+            <span>Key: <code>${escapeHtml(item.api_key || "")}</code></span>
+            <span>Input: ${escapeHtml(formatNumber(item.input_tokens || 0))} | Output: ${escapeHtml(formatNumber(item.output_tokens || 0))}</span>
+            <span>Success: ${escapeHtml(formatNumber(item.success_count || 0))} | Failed: ${escapeHtml(formatNumber(item.failure_count || 0))}</span>
+            <span>Last Used: ${escapeHtml(formatDateTime(item.last_used_at || ""))}</span>
+            <div class="meta-row">
+              <button class="action secondary" type="button" data-api-key-delete="${escapeHtml(item.key_id)}">删除</button>
+            </div>
+          </article>
+        `,
+      )
+      .join(""),
+  );
+}
+
 function applyUsageSummary(usage) {
   setText("#usage-total-input", formatNumber(usage.total_input_tokens || 0));
   setText("#usage-total-output", formatNumber(usage.total_output_tokens || 0));
@@ -1400,11 +1447,12 @@ async function loadDashboardData() {
   const historyUrl = `/admin/usage-stats/history?granularity=${encodeURIComponent(uiState.usageGranularity)}&hours=${encodeURIComponent(
     String(uiState.usageHours),
   )}`;
-  const [status, runtime, rotation, usage, accounts, proxies, relays, usageHistory, recentRequests] = await Promise.all([
+  const [status, runtime, rotation, usage, apiKeys, accounts, proxies, relays, usageHistory, recentRequests] = await Promise.all([
     loadJson(endpoints.status),
     loadJson(endpoints.runtime),
     loadJson(endpoints.rotation),
     loadJson(endpoints.usage),
+    loadJson(endpoints.apiKeys),
     loadJson(endpoints.accounts),
     loadJson(endpoints.proxies),
     loadJson(endpoints.relays),
@@ -1412,18 +1460,19 @@ async function loadDashboardData() {
     loadJson(endpoints.recentRequests),
   ]);
   uiState.lastRefreshAt = new Date().toISOString();
-  uiState.data = { status, runtime, rotation, usage, accounts, proxies, relays, usageHistory, recentRequests };
+  uiState.data = { status, runtime, rotation, usage, apiKeys, accounts, proxies, relays, usageHistory, recentRequests };
   return uiState.data;
 }
 
 function renderDashboard() {
-  const { status, runtime, rotation, usage, accounts, proxies, relays, usageHistory, recentRequests } = uiState.data;
+  const { status, runtime, rotation, usage, apiKeys, accounts, proxies, relays, usageHistory, recentRequests } = uiState.data;
   applyViewFromHash();
   applySummary(status, runtime, usage, accounts, proxies, relays, recentRequests);
   applySettings(rotation);
   renderWarnings(accounts);
   renderRecentRequests(recentRequests);
   renderAccounts(accounts);
+  renderApiKeys(apiKeys);
   renderProxies(proxies);
   renderProxyAssignments(accounts);
   renderRelays(relays);
@@ -1542,6 +1591,29 @@ async function runJob(job) {
   const output = document.querySelector("#job-result");
   output.textContent = t("jobs.running", { job });
   const result = await postJson("/admin/runtime-jobs/run", { job });
+  output.textContent = JSON.stringify(result, null, 2);
+  await render();
+}
+
+async function createApiKey() {
+  const nameInput = document.querySelector("#api-key-name");
+  const output = document.querySelector("#api-key-result");
+  const name = (nameInput?.value || "").trim();
+  output.textContent = "正在创建 API Key...";
+  const result = await postJson(endpoints.apiKeys, { name });
+  output.textContent = JSON.stringify(result, null, 2);
+  if (!result?.error) {
+    if (nameInput) {
+      nameInput.value = "";
+    }
+    await render();
+  }
+}
+
+async function deleteApiKey(keyId) {
+  const output = document.querySelector("#api-key-result");
+  output.textContent = `正在删除 API Key: ${keyId}`;
+  const result = await deleteJson(`/admin/api-keys/${encodeURIComponent(keyId)}`);
   output.textContent = JSON.stringify(result, null, 2);
   await render();
 }
@@ -1736,6 +1808,30 @@ function wireEvents() {
     if (uiState.data) {
       renderDashboard();
     }
+  });
+
+  document.querySelector("#create-api-key")?.addEventListener("click", () => {
+    createApiKey().catch((error) => {
+      setText("#api-key-result", prettyJson({ ok: false, error: String(error) }));
+    });
+  });
+
+  document.body.addEventListener("click", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+      return;
+    }
+    const deleteButton = target.closest("[data-api-key-delete]");
+    if (!deleteButton) {
+      return;
+    }
+    const keyId = deleteButton.getAttribute("data-api-key-delete") || "";
+    if (!keyId) {
+      return;
+    }
+    deleteApiKey(keyId).catch((error) => {
+      setText("#api-key-result", prettyJson({ ok: false, error: String(error) }));
+    });
   });
 }
 

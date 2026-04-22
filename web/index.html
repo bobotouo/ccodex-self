@@ -189,6 +189,21 @@
 
           <div class="stack-xl">
             <article class="card card-compact">
+              <p class="card-kicker">API Key</p>
+              <h2>API Key 管理</h2>
+              <p class="subcopy small">生成、删除并查看每个 Key 的请求与 Token 用量。</p>
+              <div class="stack">
+                <label class="field">
+                  <span>Key 名称</span>
+                  <input id="api-key-name" type="text" placeholder="例如：dev / prod / teammate-a" />
+                </label>
+                <button id="create-api-key" class="action secondary" type="button">生成新 Key</button>
+              </div>
+              <pre id="api-key-result" data-i18n="common.idle">空闲</pre>
+              <div id="api-key-list" class="list-block" data-i18n="common.loading">加载中...</div>
+            </article>
+
+            <article class="card card-compact">
               <p class="card-kicker" data-i18n="health.kicker">健康</p>
               <h2 data-i18n="health.title">状态详情</h2>
               <div id="status-details" class="detail-list" data-i18n="common.loading">加载中...</div>

@@ -50,6 +50,7 @@ STATE_ROOT = os.path.abspath(os.environ.get("LITE_RUNTIME_ROOT", os.path.dirname
 LISTEN_HOST = os.environ.get("LITE_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LITE_PORT", "18100"))
 API_KEY = os.environ.get("LITE_API_KEY", "")
+API_KEY_REQUIRED = os.environ.get("LITE_API_KEY_REQUIRED", "0").strip().lower() in {"1", "true", "yes", "on"}
 STATE_DB_PATH = os.path.abspath(os.environ.get("LITE_STATE_DB", os.path.join(STATE_ROOT, "state.sqlite3")))
 COOKIES_PATH = os.path.abspath(os.environ.get("LITE_COOKIES_PATH", os.path.join(STATE_ROOT, "cookies.json")))
 FINGERPRINT_CACHE_PATH = os.path.abspath(
@@ -78,6 +79,8 @@ SESSION_STICKY_TTL = int(os.environ.get("LITE_SESSION_STICKY_TTL", "3600") or "3
 SESSION_LOCK_TTL = int(os.environ.get("LITE_SESSION_LOCK_TTL", str(max(SESSION_STICKY_TTL, 300))) or str(max(SESSION_STICKY_TTL, 300)))
 DEFAULT_BUSINESS_KEY = os.environ.get("LITE_DEFAULT_BUSINESS_KEY", "default").strip() or "default"
 DASHBOARD_PASSWORD = os.environ.get("LITE_DASHBOARD_PASSWORD", "").strip()
+DASHBOARD_FORCE_LOGIN = os.environ.get("LITE_DASHBOARD_FORCE_LOGIN", "0").strip().lower() in {"1", "true", "yes", "on"}
+DASHBOARD_LOCAL_BYPASS = os.environ.get("LITE_DASHBOARD_LOCAL_BYPASS", "1").strip().lower() in {"1", "true", "yes", "on"}
 DASHBOARD_SESSION_COOKIE = os.environ.get("LITE_DASHBOARD_SESSION_COOKIE", "codex2gpt_dashboard_session").strip() or "codex2gpt_dashboard_session"
 DASHBOARD_SESSION_TTL = int(os.environ.get("LITE_DASHBOARD_SESSION_TTL", "43200") or "43200")
 GLOBAL_PROXY_URL = os.environ.get("LITE_GLOBAL_PROXY_URL", "").strip()
@@ -117,6 +120,9 @@ UNSUPPORTED_TOP_LEVEL_FIELDS = {
     "context_management",
     "parallel_tool_calls",
     "stream_options",
+    "verbosity",
+    "reasoningSummary",
+    "reasoning_summary",
     "reasoning_effort",
     "user",
     "n",
@@ -1211,6 +1217,10 @@ def is_local_request(client_ip):
 
 def dashboard_secret():
     return DASHBOARD_PASSWORD or API_KEY
+
+
+def dashboard_login_required():
+    return bool(DASHBOARD_FORCE_LOGIN or dashboard_secret())
 
 
 def current_rotation_mode():
@@ -4359,6 +4369,17 @@ def parse_auth_header(headers):
     return headers.get("x-api-key", "").strip()
 
 
+def hash_api_key(raw_key):
+    return hashlib.sha256(str(raw_key or "").encode("utf-8")).hexdigest()
+
+
+def summarize_usage_tokens(usage):
+    usage = usage if isinstance(usage, dict) else {}
+    input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    return input_tokens, output_tokens
+
+
 def is_retryable_error(error):
     if isinstance(error, urllib.error.HTTPError):
         return error.code in RETRYABLE_STATUS_CODES
@@ -4397,6 +4418,7 @@ class Handler(BaseHTTPRequestHandler):
         self._transcript_request_id = transcript_store.new_request_id()
         self._last_account_name = ""
         self._last_attempted_account_name = ""
+        self._api_key_context = {"source": "none", "key_id": ""}
 
     def _current_account_name(self):
         return getattr(self, "_last_account_name", "") or getattr(self, "_last_attempted_account_name", "")
@@ -4424,6 +4446,8 @@ class Handler(BaseHTTPRequestHandler):
         record = self._transcript_record_base(path, session_context, requested_model, payload, raw_payload, "completed")
         record["response"] = response_section
         self._append_transcript(record)
+        usage_payload = response_section.get("usage") if isinstance(response_section, dict) else {}
+        self._record_api_key_usage(success=True, usage=usage_payload, path=path)
         RECENT_REQUESTS.append(
             recent_request_entry(
                 path,
@@ -4443,6 +4467,7 @@ class Handler(BaseHTTPRequestHandler):
             "body": transcript_error_body(body),
         }
         self._append_transcript(record)
+        self._record_api_key_usage(success=False, usage={}, path=path, error_type=error_type, status_code=status_code)
         RECENT_REQUESTS.append(
             recent_request_entry(
                 path,
@@ -4543,10 +4568,9 @@ class Handler(BaseHTTPRequestHandler):
         return cookies
 
     def _dashboard_authenticated(self):
-        if is_local_request(self._client_ip()):
+        if is_local_request(self._client_ip()) and DASHBOARD_LOCAL_BYPASS and not DASHBOARD_FORCE_LOGIN:
             return True
-        secret = dashboard_secret()
-        if not secret:
+        if not dashboard_login_required():
             return True
         session_id = self._parse_cookies().get(DASHBOARD_SESSION_COOKIE, "")
         if not session_id:
@@ -4577,19 +4601,62 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(401, {"error": {"type": "authentication_error", "message": "dashboard login required"}})
         return False
 
+    def _resolve_api_key_context(self):
+        provided = parse_auth_header(self.headers)
+        has_managed_keys = bool(STATE_DB.list_api_keys(enabled_only=True))
+        if not API_KEY and not has_managed_keys:
+            if API_KEY_REQUIRED:
+                return {"ok": False, "source": "missing", "key_id": ""}
+            return {"ok": True, "source": "none", "key_id": ""}
+        if API_KEY and provided == API_KEY:
+            return {"ok": True, "source": "env", "key_id": ""}
+        if provided:
+            managed = STATE_DB.get_api_key_by_hash(hash_api_key(provided))
+            if managed and managed.get("enabled"):
+                return {"ok": True, "source": "managed", "key_id": managed["key_id"]}
+        return {"ok": False, "source": "invalid", "key_id": ""}
+
+    def _record_api_key_usage(self, *, success, usage, path="", error_type="", status_code=None):
+        context = getattr(self, "_api_key_context", {}) or {}
+        if context.get("source") != "managed" or not context.get("key_id"):
+            return
+        input_tokens, output_tokens = summarize_usage_tokens(usage)
+        STATE_DB.record_api_key_usage(
+            context["key_id"],
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            request_count=1,
+            success=bool(success),
+            metadata={
+                "path": path,
+                "account_name": self._current_account_name(),
+                "error_type": error_type,
+                "status_code": status_code,
+            },
+        )
+
     def _require_api_key(self):
-        if not API_KEY:
+        context = self._resolve_api_key_context()
+        self._api_key_context = {"source": context.get("source"), "key_id": context.get("key_id", "")}
+        if context.get("ok"):
             return True
-        if parse_auth_header(self.headers) == API_KEY:
-            return True
+        if context.get("source") == "missing":
+            self._write_json(
+                401,
+                {"error": {"type": "authentication_error", "message": "api key required; no api key configured"}},
+            )
+            return False
         self._write_json(401, {"error": {"type": "authentication_error", "message": "invalid api key"}})
         return False
 
     def _require_api_key_anthropic(self):
-        if not API_KEY:
+        context = self._resolve_api_key_context()
+        self._api_key_context = {"source": context.get("source"), "key_id": context.get("key_id", "")}
+        if context.get("ok"):
             return True
-        if parse_auth_header(self.headers) == API_KEY:
-            return True
+        if context.get("source") == "missing":
+            self._write_json(401, anthropic_error_payload("authentication_error", "api key required; no api key configured"))
+            return False
         self._write_json(401, anthropic_error_payload("authentication_error", "invalid api key"))
         return False
 
@@ -4649,11 +4716,164 @@ class Handler(BaseHTTPRequestHandler):
             if not self._dashboard_authenticated():
                 self._write_html(
                     200,
-                    """<!doctype html><html><body><form method="post" action="/auth/login">
-                    <h1>Codex2gpt Dashboard Login</h1>
-                    <input type="password" name="password" placeholder="Password" />
-                    <button type="submit">Login</button>
-                    </form></body></html>""",
+                    """<!doctype html>
+                    <html lang="zh-CN">
+                      <head>
+                        <meta charset="utf-8" />
+                        <meta name="viewport" content="width=device-width, initial-scale=1" />
+                        <title>Codex2gpt 登录</title>
+                        <style>
+                          :root {
+                            color-scheme: dark;
+                            --bg-0: #0b1020;
+                            --bg-1: #151c33;
+                            --bg-2: #202945;
+                            --text-0: #eaf0ff;
+                            --text-1: #a8b3d9;
+                            --accent: #66a3ff;
+                            --accent-strong: #3f89ff;
+                            --border: #2d3759;
+                            --danger: #ff6b81;
+                          }
+                          * { box-sizing: border-box; }
+                          body {
+                            margin: 0;
+                            min-height: 100vh;
+                            display: grid;
+                            place-items: center;
+                            padding: 24px;
+                            font-family: Inter, "PingFang SC", "Microsoft YaHei", -apple-system, sans-serif;
+                            color: var(--text-0);
+                            background:
+                              radial-gradient(circle at 20% 20%, #1f2d52 0%, transparent 45%),
+                              radial-gradient(circle at 80% 10%, #1d2a47 0%, transparent 38%),
+                              linear-gradient(160deg, var(--bg-0), #070b18 55%, #0b1327);
+                          }
+                          .card {
+                            width: 100%;
+                            max-width: 420px;
+                            border: 1px solid var(--border);
+                            border-radius: 16px;
+                            background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+                            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+                            overflow: hidden;
+                          }
+                          .card-head {
+                            padding: 22px 24px 16px 24px;
+                            border-bottom: 1px solid rgba(255,255,255,0.06);
+                            background: linear-gradient(180deg, rgba(102,163,255,0.12), rgba(102,163,255,0.02));
+                          }
+                          .brand {
+                            font-size: 12px;
+                            letter-spacing: 0.12em;
+                            color: var(--text-1);
+                            text-transform: uppercase;
+                            margin-bottom: 10px;
+                          }
+                          h1 {
+                            margin: 0 0 6px 0;
+                            font-size: 22px;
+                            line-height: 1.25;
+                          }
+                          .subtitle {
+                            margin: 0;
+                            color: var(--text-1);
+                            font-size: 13px;
+                            line-height: 1.55;
+                          }
+                          form {
+                            display: grid;
+                            gap: 14px;
+                            padding: 20px 24px 24px 24px;
+                          }
+                          label {
+                            font-size: 12px;
+                            color: var(--text-1);
+                            letter-spacing: 0.02em;
+                          }
+                          input[type="password"] {
+                            width: 100%;
+                            margin-top: 8px;
+                            background: var(--bg-1);
+                            color: var(--text-0);
+                            border: 1px solid var(--border);
+                            border-radius: 10px;
+                            padding: 11px 12px;
+                            font-size: 14px;
+                            outline: none;
+                            transition: border-color .15s ease, box-shadow .15s ease;
+                          }
+                          input[type="password"]:focus {
+                            border-color: var(--accent);
+                            box-shadow: 0 0 0 3px rgba(102, 163, 255, 0.18);
+                          }
+                          button {
+                            appearance: none;
+                            border: 0;
+                            border-radius: 10px;
+                            padding: 11px 14px;
+                            font-size: 14px;
+                            font-weight: 600;
+                            color: white;
+                            cursor: pointer;
+                            background: linear-gradient(180deg, var(--accent), var(--accent-strong));
+                            transition: transform .05s ease, filter .2s ease;
+                          }
+                          button:hover { filter: brightness(1.06); }
+                          button:active { transform: translateY(1px); }
+                          .hint {
+                            margin: 0;
+                            font-size: 12px;
+                            color: var(--text-1);
+                          }
+                          .error {
+                            display: none;
+                            margin: 0;
+                            color: var(--danger);
+                            font-size: 12px;
+                          }
+                          .error.show { display: block; }
+                        </style>
+                      </head>
+                      <body>
+                        <section class="card">
+                          <header class="card-head">
+                            <div class="brand">Codex2gpt Dashboard</div>
+                            <h1>登录控制台</h1>
+                            <p class="subtitle">请输入管理密码后继续。登录成功将创建会话并自动跳转。</p>
+                          </header>
+                          <form id="login-form" method="post" action="/auth/login">
+                            <label>
+                              管理密码
+                              <input type="password" name="password" placeholder="请输入 Dashboard 密码" autocomplete="current-password" required />
+                            </label>
+                            <button type="submit">登录</button>                           
+                            <p id="error" class="error">登录失败，请检查密码后重试。</p>
+                          </form>
+                        </section>
+                        <script>
+                          const form = document.getElementById("login-form");
+                          const error = document.getElementById("error");
+                          form.addEventListener("submit", async (event) => {
+                            event.preventDefault();
+                            error.classList.remove("show");
+                            const formData = new FormData(form);
+                            const payload = { password: String(formData.get("password") || "") };
+                            const response = await fetch("/auth/login", {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              credentials: "same-origin",
+                              body: JSON.stringify(payload),
+                            });
+                            if (response.ok) {
+                              window.location.href = "/";
+                              return;
+                            }
+                            error.classList.add("show");
+                          });
+                        </script>
+                      </body>
+                    </html>""",
                 )
                 return
             index_path = os.path.join(WEB_DIR, "index.html")
@@ -4669,16 +4889,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/auth/status":
             sync_accounts_with_state()
             secret = dashboard_secret()
+            local_bypass_effective = bool(DASHBOARD_LOCAL_BYPASS and not DASHBOARD_FORCE_LOGIN and is_local_request(self._client_ip()))
             codex_app = current_codex_app_state()
             self._write_json(
                 200,
                 {
                     "authenticated": self._dashboard_authenticated(),
-                    "password_required": bool(secret) and not is_local_request(self._client_ip()),
-                    "local_dashboard_bypass": is_local_request(self._client_ip()),
+                    "password_required": dashboard_login_required() and not local_bypass_effective,
+                    "local_dashboard_bypass": local_bypass_effective,
+                    "dashboard_force_login": DASHBOARD_FORCE_LOGIN,
+                    "dashboard_password_configured": bool(secret),
                     "accounts": len(STATE_DB.list_accounts()),
                     "proxies": len(STATE_DB.list_proxies()),
                     "relay_providers": len(STATE_DB.list_relay_providers(enabled_only=True)),
+                    "managed_api_keys": len(STATE_DB.list_api_keys(enabled_only=True)),
+                    "api_key_required": bool(API_KEY_REQUIRED or API_KEY or STATE_DB.list_api_keys(enabled_only=True)),
                     "rotation_mode": current_rotation_mode(),
                     "responses_transport": current_responses_transport_mode(),
                     "transport_backend": FINGERPRINT_CACHE.get("transport_backend"),
@@ -4842,6 +5067,31 @@ class Handler(BaseHTTPRequestHandler):
                 hours_value = 24
             self._write_json(200, {"data": STATE_DB.get_usage_history(hours=hours_value, granularity=granularity)})
             return
+        if path == "/admin/api-keys":
+            if not self._require_dashboard_access():
+                return
+            hours = query.get("hours", [""])[0]
+            try:
+                hours_value = int(hours) if str(hours).strip() else None
+            except ValueError:
+                hours_value = None
+            self._write_json(200, STATE_DB.get_api_key_usage_summary(hours=hours_value))
+            return
+        if path == "/admin/api-keys/usage-history":
+            if not self._require_dashboard_access():
+                return
+            key_id = str((query.get("key_id") or [""])[0] or "").strip()
+            hours = query.get("hours", ["24"])[0]
+            granularity = query.get("granularity", ["hourly"])[0]
+            try:
+                hours_value = int(hours) if str(hours).strip() else None
+            except ValueError:
+                hours_value = 24
+            self._write_json(
+                200,
+                {"data": STATE_DB.get_api_key_usage_history(key_id=key_id or None, hours=hours_value, granularity=granularity)},
+            )
+            return
         if path.startswith("/auth/accounts/") and path.endswith("/cookies"):
             if not self._require_dashboard_access():
                 return
@@ -4911,6 +5161,9 @@ class Handler(BaseHTTPRequestHandler):
                 form = urllib.parse.parse_qs(raw)
                 password = str((form.get("password") or [""])[0])
             secret = dashboard_secret()
+            if dashboard_login_required() and not secret:
+                self._write_json(400, {"error": {"type": "configuration_error", "message": "dashboard password is not configured"}})
+                return
             if secret and password != secret:
                 self._write_json(401, {"error": {"type": "authentication_error", "message": "invalid dashboard password"}})
                 return
@@ -5164,6 +5417,37 @@ class Handler(BaseHTTPRequestHandler):
                 metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
             )
             self._write_json(200, provider)
+            return
+
+        if path == "/admin/api-keys":
+            if not self._require_dashboard_access():
+                return
+            payload = self._read_json()
+            name = str((payload.get("name") if isinstance(payload, dict) else "") or "").strip() or "default"
+            key_id = secrets.token_hex(8)
+            raw_key = f"c2g_{secrets.token_urlsafe(24)}"
+            key_record = STATE_DB.upsert_api_key(
+                key_id,
+                name=name,
+                api_key=raw_key,
+                key_hash=hash_api_key(raw_key),
+                key_prefix=raw_key[:10],
+                enabled=True,
+                metadata={"created_by": self._client_ip()},
+            )
+            self._write_json(
+                200,
+                {
+                    "key": raw_key,
+                    "record": {
+                        "key_id": key_record.get("key_id"),
+                        "name": key_record.get("name"),
+                        "key_prefix": key_record.get("key_prefix"),
+                        "enabled": key_record.get("enabled"),
+                        "created_at": key_record.get("created_at"),
+                    },
+                },
+            )
             return
 
         if path.startswith("/auth/accounts/") and path.endswith("/reset-usage"):
@@ -6019,6 +6303,16 @@ class Handler(BaseHTTPRequestHandler):
             provider_id = urllib.parse.unquote(path[len("/api/relay-providers/") :]).strip("/")
             STATE_DB.delete_relay_provider(provider_id)
             self._write_json(200, {"deleted": True, "provider_id": provider_id})
+            return
+        if path.startswith("/admin/api-keys/"):
+            if not self._require_dashboard_access():
+                return
+            key_id = urllib.parse.unquote(path[len("/admin/api-keys/") :]).strip("/")
+            if not key_id:
+                self._write_json(400, {"error": {"type": "invalid_request_error", "message": "key_id is required"}})
+                return
+            STATE_DB.delete_api_key(key_id)
+            self._write_json(200, {"deleted": True, "key_id": key_id})
             return
         if path == "/auth/login":
             self.send_response(200)

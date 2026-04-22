@@ -147,8 +147,46 @@ class RuntimeStateStore:
 
             CREATE INDEX IF NOT EXISTS idx_usage_snapshots_account_time
             ON usage_snapshots(account_id, captured_at);
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                key_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '',
+                key_hash TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                last_used_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_api_keys_enabled
+            ON api_keys(enabled);
+
+            CREATE TABLE IF NOT EXISTS api_key_usage_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_id TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                request_count INTEGER NOT NULL DEFAULT 1,
+                success_count INTEGER NOT NULL DEFAULT 1,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY (key_id) REFERENCES api_keys(key_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_api_key_usage_events_key_time
+            ON api_key_usage_events(key_id, recorded_at);
             """
         )
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(api_keys)").fetchall()
+        }
+        if "api_key" not in columns:
+            self._conn.execute("ALTER TABLE api_keys ADD COLUMN api_key TEXT NOT NULL DEFAULT ''")
         self._conn.commit()
 
     def upsert_account(self, entry_id: str, **fields: Any) -> dict[str, Any]:
@@ -604,4 +642,241 @@ class RuntimeStateStore:
             grouped[key]["input_tokens"] += int(row["input_tokens"])
             grouped[key]["output_tokens"] += int(row["output_tokens"])
             grouped[key]["request_count"] += int(row["request_count"])
+        return [grouped[key] for key in sorted(grouped)]
+
+    def upsert_api_key(
+        self,
+        key_id: str,
+        *,
+        name: str,
+        api_key: str,
+        key_hash: str,
+        key_prefix: str,
+        enabled: bool = True,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = _utcnow_iso()
+        existing = self.get_api_key(key_id)
+        created_at = existing["created_at"] if existing else now
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO api_keys (
+                    key_id, name, api_key, key_hash, key_prefix, enabled, metadata_json, last_used_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key_id) DO UPDATE SET
+                    name = excluded.name,
+                    api_key = excluded.api_key,
+                    key_hash = excluded.key_hash,
+                    key_prefix = excluded.key_prefix,
+                    enabled = excluded.enabled,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key_id,
+                    name,
+                    api_key,
+                    key_hash,
+                    key_prefix,
+                    1 if enabled else 0,
+                    _dumps(metadata if metadata is not None else (existing["metadata"] if existing else {})),
+                    existing["last_used_at"] if existing else None,
+                    created_at,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        return self.get_api_key(key_id) or {}
+
+    def get_api_key(self, key_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM api_keys WHERE key_id = ?", (key_id,)).fetchone()
+        return self._row_to_api_key(row) if row else None
+
+    def get_api_key_by_hash(self, key_hash: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM api_keys WHERE key_hash = ?", (key_hash,)).fetchone()
+        return self._row_to_api_key(row) if row else None
+
+    def list_api_keys(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM api_keys"
+        params: list[Any] = []
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY created_at DESC, key_id DESC"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [self._row_to_api_key(row) for row in rows]
+
+    def _row_to_api_key(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "key_id": row["key_id"],
+            "name": row["name"],
+            "api_key": row["api_key"],
+            "key_hash": row["key_hash"],
+            "key_prefix": row["key_prefix"],
+            "enabled": bool(row["enabled"]),
+            "metadata": _loads(row["metadata_json"], {}),
+            "last_used_at": row["last_used_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def delete_api_key(self, key_id: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM api_keys WHERE key_id = ?", (key_id,))
+            self._conn.commit()
+
+    def record_api_key_usage(
+        self,
+        key_id: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        request_count: int = 1,
+        success: bool = True,
+        recorded_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        timestamp = _ensure_iso(recorded_at)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO api_key_usage_events (
+                    key_id, recorded_at, input_tokens, output_tokens, request_count, success_count, failure_count, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key_id,
+                    timestamp,
+                    int(input_tokens),
+                    int(output_tokens),
+                    max(0, int(request_count)),
+                    max(0, int(request_count)) if success else 0,
+                    max(0, int(request_count)) if not success else 0,
+                    _dumps(metadata or {}),
+                ),
+            )
+            self._conn.execute(
+                """
+                UPDATE api_keys
+                SET last_used_at = ?, updated_at = ?
+                WHERE key_id = ?
+                """,
+                (timestamp, _utcnow_iso(), key_id),
+            )
+            self._conn.commit()
+
+    def get_api_key_usage_summary(self, *, hours: int | None = None) -> dict[str, Any]:
+        params: list[Any] = []
+        where_clause = ""
+        if hours is not None:
+            cutoff = datetime.now(timezone.utc).timestamp() - (max(1, int(hours)) * 3600)
+            where_clause = "WHERE strftime('%s', e.recorded_at) >= ?"
+            params.append(int(cutoff))
+        sql = f"""
+            SELECT
+                k.key_id,
+                k.name,
+                k.api_key,
+                k.key_prefix,
+                k.enabled,
+                k.last_used_at,
+                COALESCE(SUM(e.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(e.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(e.request_count), 0) AS request_count,
+                COALESCE(SUM(e.success_count), 0) AS success_count,
+                COALESCE(SUM(e.failure_count), 0) AS failure_count
+            FROM api_keys AS k
+            LEFT JOIN api_key_usage_events AS e ON e.key_id = k.key_id
+            {where_clause}
+            GROUP BY k.key_id, k.name, k.api_key, k.key_prefix, k.enabled, k.last_used_at
+            ORDER BY k.created_at DESC, k.key_id DESC
+        """
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        data = [
+            {
+                "key_id": row["key_id"],
+                "name": row["name"],
+                "api_key": row["api_key"],
+                "key_prefix": row["key_prefix"],
+                "enabled": bool(row["enabled"]),
+                "last_used_at": row["last_used_at"],
+                "input_tokens": int(row["input_tokens"]),
+                "output_tokens": int(row["output_tokens"]),
+                "request_count": int(row["request_count"]),
+                "success_count": int(row["success_count"]),
+                "failure_count": int(row["failure_count"]),
+            }
+            for row in rows
+        ]
+        return {
+            "key_count": len(data),
+            "active_key_count": sum(1 for item in data if item["enabled"]),
+            "total_input_tokens": sum(item["input_tokens"] for item in data),
+            "total_output_tokens": sum(item["output_tokens"] for item in data),
+            "total_request_count": sum(item["request_count"] for item in data),
+            "total_success_count": sum(item["success_count"] for item in data),
+            "total_failure_count": sum(item["failure_count"] for item in data),
+            "data": data,
+        }
+
+    def get_api_key_usage_history(
+        self,
+        *,
+        key_id: str | None = None,
+        hours: int | None = 24,
+        granularity: str = "hourly",
+    ) -> list[dict[str, Any]]:
+        if granularity not in {"raw", "hourly", "daily"}:
+            raise ValueError("granularity must be raw, hourly, or daily")
+        sql = """
+            SELECT key_id, recorded_at, input_tokens, output_tokens, request_count, success_count, failure_count
+            FROM api_key_usage_events
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        if key_id:
+            where.append("key_id = ?")
+            params.append(key_id)
+        if hours is not None:
+            cutoff = datetime.now(timezone.utc).timestamp() - (max(1, int(hours)) * 3600)
+            where.append("strftime('%s', recorded_at) >= ?")
+            params.append(int(cutoff))
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY recorded_at ASC, event_id ASC"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return self._bucketize_api_key_usage(rows, granularity)
+
+    def _bucketize_api_key_usage(self, rows: Iterable[sqlite3.Row], granularity: str) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            timestamp = _parse_iso(row["recorded_at"])
+            if timestamp is None:
+                continue
+            if granularity == "raw":
+                bucket = timestamp.replace(microsecond=0)
+            elif granularity == "hourly":
+                bucket = timestamp.replace(minute=0, second=0, microsecond=0)
+            else:
+                bucket = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+            key = bucket.isoformat(timespec="seconds")
+            if key not in grouped:
+                grouped[key] = {
+                    "timestamp": key,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "request_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                }
+            grouped[key]["input_tokens"] += int(row["input_tokens"])
+            grouped[key]["output_tokens"] += int(row["output_tokens"])
+            grouped[key]["request_count"] += int(row["request_count"])
+            grouped[key]["success_count"] += int(row["success_count"])
+            grouped[key]["failure_count"] += int(row["failure_count"])
         return [grouped[key] for key in sorted(grouped)]

@@ -215,6 +215,61 @@ class RuntimeStateStoreTests(unittest.TestCase):
         self.assertEqual(daily[0]["input_tokens"], 42)
         self.assertEqual(daily[0]["request_count"], 5)
 
+    def test_api_key_crud_and_usage(self):
+        self.store.upsert_api_key(
+            "key-1",
+            name="dev",
+            api_key="c2g_key_1",
+            key_hash="hash-1",
+            key_prefix="c2g_abc123",
+            enabled=True,
+        )
+        self.store.upsert_api_key(
+            "key-2",
+            name="prod",
+            api_key="c2g_key_2",
+            key_hash="hash-2",
+            key_prefix="c2g_xyz456",
+            enabled=False,
+        )
+        self.store.record_api_key_usage(
+            "key-1",
+            input_tokens=11,
+            output_tokens=7,
+            request_count=1,
+            success=True,
+            recorded_at="2026-03-24T01:00:00+00:00",
+        )
+        self.store.record_api_key_usage(
+            "key-1",
+            input_tokens=5,
+            output_tokens=2,
+            request_count=1,
+            success=False,
+            recorded_at="2026-03-24T01:30:00+00:00",
+        )
+
+        enabled = self.store.list_api_keys(enabled_only=True)
+        self.assertEqual([item["key_id"] for item in enabled], ["key-1"])
+        self.assertEqual(enabled[0]["api_key"], "c2g_key_1")
+        self.assertEqual(self.store.get_api_key_by_hash("hash-1")["key_id"], "key-1")
+
+        summary = self.store.get_api_key_usage_summary(hours=None)
+        self.assertEqual(summary["key_count"], 2)
+        self.assertEqual(summary["active_key_count"], 1)
+        self.assertEqual(summary["total_input_tokens"], 16)
+        self.assertEqual(summary["total_request_count"], 2)
+        self.assertEqual(summary["total_success_count"], 1)
+        self.assertEqual(summary["total_failure_count"], 1)
+
+        history = self.store.get_api_key_usage_history(key_id="key-1", hours=None, granularity="hourly")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["input_tokens"], 16)
+        self.assertEqual(history[0]["failure_count"], 1)
+
+        self.store.delete_api_key("key-2")
+        self.assertEqual([item["key_id"] for item in self.store.list_api_keys()], ["key-1"])
+
 
 if __name__ == "__main__":
     unittest.main()

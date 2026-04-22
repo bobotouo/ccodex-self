@@ -5,3 +5,5 @@ runtime/
 .DS_Store
 AGENTS.md
 agent.md
+__pycache__/
+*.py[cod]
