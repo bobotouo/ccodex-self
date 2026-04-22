@@ -10,6 +10,17 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+#
+# Vercel functions run with read-only project files.
+# Default runtime artifacts to /tmp unless explicitly configured.
+#
+os.environ.setdefault("LITE_RUNTIME_ROOT", "/tmp/codex2gpt-runtime")
+os.environ.setdefault("LITE_AUTH_DIR", "/tmp/codex2gpt-runtime/accounts")
+os.environ.setdefault("LITE_STATE_DB", "/tmp/codex2gpt-runtime/state.sqlite3")
+os.environ.setdefault("LITE_COOKIES_PATH", "/tmp/codex2gpt-runtime/cookies.json")
+os.environ.setdefault("LITE_SETTINGS_PATH", "/tmp/codex2gpt-runtime/settings.json")
+os.environ.setdefault("LITE_FINGERPRINT_CACHE_PATH", "/tmp/codex2gpt-runtime/fingerprint-cache.json")
+
 import app as legacy
 
 
