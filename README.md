@@ -1,6 +1,4 @@
-# codex2gpt
-
-[English](./README_EN.md)
+# codex 管理
 
 统一接入 Codex 账号池、代理路由、请求记录和基础运维面板。
 
