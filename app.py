@@ -115,6 +115,7 @@ UNSUPPORTED_TOP_LEVEL_FIELDS = {
     "max_tokens",
     "max_completion_tokens",
     "temperature",
+    "top_p",
     "metadata",
     "service_tier",
     "output_config",
@@ -860,8 +861,23 @@ class OAuthAccount:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                refreshed = json.load(resp)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    refreshed = json.load(resp)
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    raw = exc.read().decode("utf-8", errors="replace")
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        err = parsed.get("error") if isinstance(parsed.get("error"), dict) else {}
+                        detail = str(err.get("message") or raw).strip()
+                    else:
+                        detail = raw.strip()
+                except Exception:
+                    detail = ""
+                message = detail or str(exc)
+                raise RuntimeError(f"refresh failed ({exc.code}): {message}") from exc
             tokens = data.setdefault("tokens", {})
             tokens["access_token"] = refreshed["access_token"]
             if refreshed.get("refresh_token"):
