@@ -190,6 +190,25 @@ def _sync_db_accounts_to_legacy_runtime() -> None:
     legacy.sync_accounts_with_state()
 
 
+def _mirror_session_to_legacy(session_id: str, remote_addr: str = "") -> None:
+    if not session_id:
+        return
+    if not STATE_DB.validate_dashboard_session(session_id):
+        return
+    expires_at = (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=max(60, DASHBOARD_SESSION_TTL))
+    ).isoformat(timespec="seconds")
+    try:
+        legacy.STATE_DB.create_dashboard_session(
+            session_id,
+            expires_at=expires_at,
+            remote_addr=remote_addr,
+            created_at=now_iso(),
+        )
+    except Exception:
+        pass
+
+
 class _CaseHeaders:
     def __init__(self, source: dict[str, str]):
         self._data = {str(k).lower(): str(v) for k, v in source.items()}
@@ -521,6 +540,7 @@ async def auth_login(request: Request):
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=max(60, DASHBOARD_SESSION_TTL))
     ).isoformat(timespec="seconds")
     STATE_DB.create_dashboard_session(session_id, expires_at=expires_at, remote_addr=_client_ip(request))
+    _mirror_session_to_legacy(session_id, _client_ip(request))
     response = JSONResponse(status_code=200, content={"ok": True})
     _set_dashboard_cookie(response, session_id)
     return response
@@ -531,6 +551,10 @@ def auth_logout(request: Request):
     session_id = request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip()
     if session_id:
         STATE_DB.delete_dashboard_session(session_id)
+        try:
+            legacy.STATE_DB.delete_dashboard_session(session_id)
+        except Exception:
+            pass
     response = JSONResponse(status_code=200, content={"ok": True})
     response.delete_cookie(DASHBOARD_SESSION_COOKIE, path="/")
     return response
@@ -879,6 +903,10 @@ async def legacy_fallback(path: str, request: Request):
         full_path = f"{full_path}?{query}"
     try:
         _sync_db_accounts_to_legacy_runtime()
+    except Exception:
+        pass
+    try:
+        _mirror_session_to_legacy(request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(), _client_ip(request))
     except Exception:
         pass
     body = await request.body()
