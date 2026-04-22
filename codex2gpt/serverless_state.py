@@ -105,6 +105,15 @@ class ServerlessStateStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_api_key_usage_events_key_time
                     ON api_key_usage_events(key_id, recorded_at);
+                    CREATE TABLE IF NOT EXISTS oauth_pkce_sessions (
+                        state TEXT PRIMARY KEY,
+                        verifier TEXT NOT NULL,
+                        redirect_uri TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        completed INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_oauth_pkce_sessions_created_at
+                    ON oauth_pkce_sessions(created_at);
                     """
                 )
                 cur.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auth_file TEXT")
@@ -441,3 +450,108 @@ class ServerlessStateStore:
             "total_failure_count": sum(item["failure_count"] for item in data),
             "data": data,
         }
+
+    # ---- oauth pkce sessions ----
+    def upsert_oauth_pkce_session(self, state: str, *, verifier: str, redirect_uri: str, created_at: str | None = None, completed: bool = False) -> None:
+        ts = created_at or _utcnow_iso()
+        if self._backend == "sqlite":
+            account = self._sqlite.get_account("__oauth_pkce_state__") or {}
+            mapping = dict(account.get("metadata") or {})
+            mapping[state] = {
+                "verifier": verifier,
+                "redirect_uri": redirect_uri,
+                "created_at": ts,
+                "completed": bool(completed),
+            }
+            self._sqlite.upsert_account(
+                "__oauth_pkce_state__",
+                status="disabled",
+                metadata=mapping,
+                quota={},
+                usage={},
+            )
+            return
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO oauth_pkce_sessions (state, verifier, redirect_uri, created_at, completed)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT(state) DO UPDATE SET
+                        verifier = EXCLUDED.verifier,
+                        redirect_uri = EXCLUDED.redirect_uri,
+                        created_at = EXCLUDED.created_at,
+                        completed = EXCLUDED.completed
+                    """,
+                    (state, verifier, redirect_uri, ts, 1 if completed else 0),
+                )
+
+    def get_oauth_pkce_session(self, state: str) -> dict[str, Any] | None:
+        if self._backend == "sqlite":
+            account = self._sqlite.get_account("__oauth_pkce_state__") or {}
+            mapping = dict(account.get("metadata") or {})
+            item = mapping.get(state)
+            if not isinstance(item, dict):
+                return None
+            return {
+                "state": state,
+                "verifier": str(item.get("verifier") or ""),
+                "redirect_uri": str(item.get("redirect_uri") or ""),
+                "created_at": str(item.get("created_at") or ""),
+                "completed": bool(item.get("completed")),
+            }
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT state, verifier, redirect_uri, created_at, completed
+                    FROM oauth_pkce_sessions
+                    WHERE state = %s
+                    """,
+                    (state,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "state": row[0],
+            "verifier": row[1],
+            "redirect_uri": row[2],
+            "created_at": row[3],
+            "completed": bool(row[4]),
+        }
+
+    def mark_oauth_pkce_completed(self, state: str) -> None:
+        if self._backend == "sqlite":
+            session = self.get_oauth_pkce_session(state)
+            if not session:
+                return
+            self.upsert_oauth_pkce_session(
+                state,
+                verifier=session["verifier"],
+                redirect_uri=session["redirect_uri"],
+                created_at=session.get("created_at"),
+                completed=True,
+            )
+            return
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE oauth_pkce_sessions SET completed = 1 WHERE state = %s", (state,))
+
+    def delete_oauth_pkce_session(self, state: str) -> None:
+        if self._backend == "sqlite":
+            account = self._sqlite.get_account("__oauth_pkce_state__") or {}
+            mapping = dict(account.get("metadata") or {})
+            if state in mapping:
+                mapping.pop(state, None)
+                self._sqlite.upsert_account(
+                    "__oauth_pkce_state__",
+                    status="disabled",
+                    metadata=mapping,
+                    quota={},
+                    usage={},
+                )
+            return
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM oauth_pkce_sessions WHERE state = %s", (state,))
