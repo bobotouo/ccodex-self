@@ -38,6 +38,7 @@ CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
 AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 OAUTH_CALLBACK_TTL_SECONDS = int(os.environ.get("LITE_OAUTH_CALLBACK_TTL_SECONDS", "300") or "300")
+LEGACY_SYNC_INTERVAL_MS = int(os.environ.get("LITE_LEGACY_SYNC_INTERVAL_MS", "800") or "800")
 
 # Keep legacy runtime artifacts writable in serverless environment.
 os.environ.setdefault("LITE_RUNTIME_ROOT", "/tmp/codex2gpt-runtime")
@@ -48,6 +49,10 @@ os.environ.setdefault("LITE_SETTINGS_PATH", "/tmp/codex2gpt-runtime/settings.jso
 os.environ.setdefault("LITE_FINGERPRINT_CACHE_PATH", "/tmp/codex2gpt-runtime/fingerprint-cache.json")
 
 import app as legacy
+
+_LEGACY_SYNC_LOCK = threading.RLock()
+_LEGACY_LAST_SYNC_MONO = 0.0
+_LEGACY_LAST_SYNC_ERROR = ""
 
 
 def is_local_request(client_ip: str) -> bool:
@@ -190,6 +195,32 @@ def _sync_db_accounts_to_legacy_runtime() -> None:
     legacy.sync_accounts_with_state()
 
 
+def _sync_api_keys_to_legacy_state() -> None:
+    try:
+        pg_keys = STATE_DB.list_api_keys(enabled_only=False)
+        legacy_keys = {item.get("key_id"): item for item in legacy.STATE_DB.list_api_keys(enabled_only=False)}
+        pg_ids: set[str] = set()
+        for item in pg_keys:
+            key_id = str(item.get("key_id") or "").strip()
+            if not key_id:
+                continue
+            pg_ids.add(key_id)
+            legacy.STATE_DB.upsert_api_key(
+                key_id,
+                name=str(item.get("name") or key_id),
+                api_key=str(item.get("api_key") or ""),
+                key_hash=str(item.get("key_hash") or ""),
+                key_prefix=str(item.get("key_prefix") or ""),
+                enabled=bool(item.get("enabled")),
+                metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+            )
+        for key_id in legacy_keys:
+            if key_id and key_id not in pg_ids:
+                legacy.STATE_DB.delete_api_key(str(key_id))
+    except Exception:
+        pass
+
+
 def _mirror_session_to_legacy(session_id: str, remote_addr: str = "") -> None:
     if not session_id:
         return
@@ -207,6 +238,35 @@ def _mirror_session_to_legacy(session_id: str, remote_addr: str = "") -> None:
         )
     except Exception:
         pass
+
+
+def _sync_legacy_runtime_state(*, session_id: str = "", remote_addr: str = "", force: bool = False) -> None:
+    """Best-effort sync for all bridge-dependent legacy state.
+
+    This reduces drift between serverless DB-backed state and legacy runtime state.
+    """
+    global _LEGACY_LAST_SYNC_MONO, _LEGACY_LAST_SYNC_ERROR
+    now_mono = time.monotonic()
+    if not force and (now_mono - _LEGACY_LAST_SYNC_MONO) * 1000 < max(0, LEGACY_SYNC_INTERVAL_MS):
+        if session_id:
+            _mirror_session_to_legacy(session_id, remote_addr)
+        return
+    with _LEGACY_SYNC_LOCK:
+        now_mono = time.monotonic()
+        if not force and (now_mono - _LEGACY_LAST_SYNC_MONO) * 1000 < max(0, LEGACY_SYNC_INTERVAL_MS):
+            if session_id:
+                _mirror_session_to_legacy(session_id, remote_addr)
+            return
+        try:
+            _sync_db_accounts_to_legacy_runtime()
+            _sync_api_keys_to_legacy_state()
+            if session_id:
+                _mirror_session_to_legacy(session_id, remote_addr)
+            _LEGACY_LAST_SYNC_ERROR = ""
+        except Exception as exc:  # pragma: no cover
+            _LEGACY_LAST_SYNC_ERROR = str(exc)
+        finally:
+            _LEGACY_LAST_SYNC_MONO = time.monotonic()
 
 
 class _CaseHeaders:
@@ -347,6 +407,8 @@ def health() -> dict[str, Any]:
         "mode": "serverless",
         "migration_phase": 2,
         "state_backend": STATE_DB.backend,
+        "legacy_sync_interval_ms": LEGACY_SYNC_INTERVAL_MS,
+        "legacy_last_sync_error": _LEGACY_LAST_SYNC_ERROR,
         "message": "Dashboard/auth APIs are DB-backed; proxy APIs are in progress.",
     }
 
@@ -540,7 +602,7 @@ async def auth_login(request: Request):
         datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=max(60, DASHBOARD_SESSION_TTL))
     ).isoformat(timespec="seconds")
     STATE_DB.create_dashboard_session(session_id, expires_at=expires_at, remote_addr=_client_ip(request))
-    _mirror_session_to_legacy(session_id, _client_ip(request))
+    _sync_legacy_runtime_state(session_id=session_id, remote_addr=_client_ip(request), force=True)
     response = JSONResponse(status_code=200, content={"ok": True})
     _set_dashboard_cookie(response, session_id)
     return response
@@ -587,14 +649,10 @@ def auth_accounts(request: Request):
     reject = _require_dashboard(request)
     if reject is not None:
         return reject
-    try:
-        _sync_db_accounts_to_legacy_runtime()
-    except Exception:
-        pass
-    try:
-        _mirror_session_to_legacy(request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(), _client_ip(request))
-    except Exception:
-        pass
+    _sync_legacy_runtime_state(
+        session_id=request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(),
+        remote_addr=_client_ip(request),
+    )
     full_path = "/auth/accounts"
     query = request.url.query
     if query:
@@ -873,6 +931,7 @@ async def create_api_key(request: Request):
         enabled=True,
         metadata={"created_by": _client_ip(request), "source": "serverless"},
     )
+    _sync_legacy_runtime_state(force=True)
     return {
         "key": raw_key,
         "record": {
@@ -891,6 +950,7 @@ def delete_api_key(key_id: str, request: Request):
     if reject is not None:
         return reject
     STATE_DB.delete_api_key(key_id)
+    _sync_legacy_runtime_state(force=True)
     return {"deleted": True, "key_id": key_id}
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -900,14 +960,10 @@ async def legacy_fallback(path: str, request: Request):
     query = request.url.query
     if query:
         full_path = f"{full_path}?{query}"
-    try:
-        _sync_db_accounts_to_legacy_runtime()
-    except Exception:
-        pass
-    try:
-        _mirror_session_to_legacy(request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(), _client_ip(request))
-    except Exception:
-        pass
+    _sync_legacy_runtime_state(
+        session_id=request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(),
+        remote_addr=_client_ip(request),
+    )
     body = await request.body()
     wants_stream = _is_streaming_request("/" + path, request.method, body)
     stream_sink = _StreamSink() if wants_stream else None
