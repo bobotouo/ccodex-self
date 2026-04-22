@@ -611,8 +611,70 @@ def current_transport_backend():
     return "direct"
 
 
-def order_headers(headers):
-    order = FINGERPRINT_CACHE.get("header_order")
+def _fingerprint_profile_for_account(account_name: str = ""):
+    cache = FINGERPRINT_CACHE if isinstance(FINGERPRINT_CACHE, dict) else {}
+    pool = cache.get("pool")
+    if not isinstance(pool, list) or not pool:
+        return cache
+    if len(pool) == 1:
+        selected = pool[0]
+        return selected if isinstance(selected, dict) else cache
+    key = str(account_name or "").strip()
+    if not key:
+        key = "anonymous"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    idx = int(digest[:8], 16) % len(pool)
+    selected = pool[idx]
+    return selected if isinstance(selected, dict) else cache
+
+
+def _rebuild_fingerprint_pool(base_fingerprint: dict[str, Any], *, pool_size: int = 6):
+    size = max(1, min(int(pool_size or 1), 32))
+    base = dict(base_fingerprint or {})
+    existing = base.get("pool")
+    if isinstance(existing, list) and len(existing) == size and all(isinstance(item, dict) for item in existing):
+        return existing
+    app_version = str(base.get("app_version") or "0.104.0")
+    chromium_version = str(base.get("chromium_version") or "131.0.6778.265")
+    platform = str(base.get("platform") or "Mac OS X")
+    arch = str(base.get("arch") or "arm64")
+    originator = str(base.get("originator") or "codex_cli_rs")
+    default_headers = dict(base.get("default_headers") or {})
+    header_order = list(base.get("header_order") or [])
+    variants = []
+    for i in range(size):
+        variant = dict(base)
+        variant["fingerprint_id"] = f"fp-{i + 1}"
+        variant["app_version"] = app_version
+        variant["build_number"] = f"{base.get('build_number') or 'dev'}-{i + 1}"
+        variant["chromium_version"] = chromium_version
+        variant["platform"] = platform
+        variant["arch"] = arch
+        variant["originator"] = f"{originator}_{i + 1}"
+        variant["default_headers"] = dict(default_headers)
+        variant["header_order"] = list(header_order)
+        variants.append(variant)
+    return variants
+
+
+def _auto_fingerprint_pool_size() -> int:
+    count = 0
+    try:
+        if os.path.isdir(AUTH_DIR):
+            for name in os.listdir(AUTH_DIR):
+                if name.endswith(".json"):
+                    count += 1
+    except Exception:
+        count = 0
+    # Keep at least 6 fingerprints; grow with account count automatically.
+    if count <= 0:
+        return 6
+    return max(6, min(24, count * 2))
+
+
+def order_headers(headers, *, account_name: str = "", fingerprint: dict[str, Any] | None = None):
+    profile = fingerprint if isinstance(fingerprint, dict) else _fingerprint_profile_for_account(account_name)
+    order = profile.get("header_order") if isinstance(profile, dict) else None
     if not isinstance(order, list):
         return headers
     ordered = {}
@@ -630,41 +692,45 @@ def order_headers(headers):
     return ordered
 
 
-def build_sec_ch_ua():
-    chromium_version = str(FINGERPRINT_CACHE.get("chromium_version") or "131")
+def build_sec_ch_ua(fingerprint: dict[str, Any] | None = None):
+    profile = fingerprint if isinstance(fingerprint, dict) else _fingerprint_profile_for_account("")
+    chromium_version = str(profile.get("chromium_version") or "131")
     major = chromium_version.split(".", 1)[0] or "131"
     return f'"Chromium";v="{major}", "Not:A-Brand";v="24"'
 
 
-def build_desktop_user_agent():
-    app_version = str(FINGERPRINT_CACHE.get("app_version") or "0.104.0")
-    platform = str(FINGERPRINT_CACHE.get("platform") or "Mac OS X")
-    arch = str(FINGERPRINT_CACHE.get("arch") or "arm64")
+def build_desktop_user_agent(fingerprint: dict[str, Any] | None = None):
+    profile = fingerprint if isinstance(fingerprint, dict) else _fingerprint_profile_for_account("")
+    app_version = str(profile.get("app_version") or "0.104.0")
+    platform = str(profile.get("platform") or "Mac OS X")
+    arch = str(profile.get("arch") or "arm64")
     return f"Codex Desktop/{app_version} ({platform}; {arch})"
 
 
-def build_default_desktop_headers():
-    defaults = dict(FINGERPRINT_CACHE.get("default_headers") or {})
-    defaults.setdefault("User-Agent", build_desktop_user_agent())
-    defaults.setdefault("sec-ch-ua", build_sec_ch_ua())
+def build_default_desktop_headers(account_name: str = "", fingerprint: dict[str, Any] | None = None):
+    profile = fingerprint if isinstance(fingerprint, dict) else _fingerprint_profile_for_account(account_name)
+    defaults = dict(profile.get("default_headers") or {})
+    defaults.setdefault("User-Agent", build_desktop_user_agent(profile))
+    defaults.setdefault("sec-ch-ua", build_sec_ch_ua(profile))
     defaults.setdefault("Origin", "https://chatgpt.com")
     defaults.setdefault("Referer", "https://chatgpt.com/codex")
     defaults.setdefault("Accept", "text/event-stream")
-    defaults.setdefault("originator", str(FINGERPRINT_CACHE.get("originator") or "codex_cli_rs"))
+    defaults.setdefault("originator", str(profile.get("originator") or "codex_cli_rs"))
     return defaults
 
 
 def build_anonymous_desktop_headers():
-    headers = build_default_desktop_headers()
+    headers = build_default_desktop_headers("anonymous")
     headers.pop("Content-Type", None)
     headers.pop("Cookie", None)
-    return order_headers(headers)
+    return order_headers(headers, account_name="anonymous")
 
 
 RUNTIME_SETTINGS = load_runtime_settings()
 COOKIE_STORE = load_cookie_store()
 FINGERPRINT_CACHE = load_fingerprint_cache()
 FINGERPRINT_CACHE["transport_backend"] = current_transport_backend()
+FINGERPRINT_CACHE["pool"] = _rebuild_fingerprint_pool(FINGERPRINT_CACHE, pool_size=_auto_fingerprint_pool_size())
 STATE_DB = RuntimeStateStore(STATE_DB_PATH)
 atexit.register(STATE_DB.close)
 
@@ -1767,14 +1833,14 @@ def perform_relay_request(provider, codex_payload, *, timeout=120):
 
 
 def fetch_account_quota(account):
-    headers = build_default_desktop_headers()
+    headers = build_default_desktop_headers(account.name)
     headers["Authorization"] = f"Bearer {account.access_token()}"
     headers["Accept"] = "application/json"
     headers.pop("Content-Type", None)
     cookie_header = account_cookie_header(account.name)
     if cookie_header:
         headers["Cookie"] = cookie_header
-    request = urllib.request.Request(QUOTA_URL, headers=order_headers(headers), method="GET")
+    request = urllib.request.Request(QUOTA_URL, headers=order_headers(headers, account_name=account.name), method="GET")
     proxy_url = resolve_proxy_url_for_account(account.name)
     payload = load_json_with_transport_fallback(request, proxy_url=proxy_url, timeout=30, account_name=account.name)
     if not isinstance(payload, dict):
@@ -2320,7 +2386,7 @@ def start_oauth_callback_server():
 atexit.register(stop_oauth_callback_server)
 
 
-def refresh_accounts_if_needed(force=False):
+def refresh_accounts_if_needed(force=False, refresh_expired=False):
     refreshed = []
     now_ts = int(time.time())
     for account in pool.accounts:
@@ -2328,9 +2394,11 @@ def refresh_accounts_if_needed(force=False):
         tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
         claims = decode_jwt_payload(tokens.get("access_token") or tokens.get("id_token") or "")
         exp = int(claims.get("exp") or 0)
+        record = STATE_DB.get_account(account.name) or {}
+        should_force_this = bool(refresh_expired and str(record.get("status") or "").strip().lower() == "expired")
         backoff = TOKEN_REFRESH_BACKOFF.get(account.name, {})
         retry_after = int(backoff.get("retry_after") or 0)
-        if not force:
+        if not force and not should_force_this:
             if retry_after and now_ts < retry_after:
                 continue
             if exp and exp - now_ts > TOKEN_REFRESH_MARGIN_SECONDS:
@@ -2357,7 +2425,7 @@ def refresh_fingerprint_cache(force=False):
             with urlopen_with_optional_proxy(request, timeout=15) as response:
                 payload = json.load(response)
             if isinstance(payload, dict):
-                for key in ("app_version", "build_number", "chromium_version", "header_order", "default_headers"):
+                for key in ("app_version", "build_number", "chromium_version", "header_order", "default_headers", "platform", "arch", "originator", "pool"):
                     if key in payload:
                         updated[key] = payload[key]
                         changed = True
@@ -2367,6 +2435,14 @@ def refresh_fingerprint_cache(force=False):
     if not changed:
         updated["transport_backend"] = current_transport_backend()
     updated["updated_at"] = now_iso()
+    pool_size = _auto_fingerprint_pool_size()
+    if not isinstance(updated.get("pool"), list):
+        updated["pool"] = _rebuild_fingerprint_pool(updated, pool_size=pool_size)
+    else:
+        # Keep externally managed pool if valid, otherwise regenerate.
+        pool = updated.get("pool")
+        if not pool or not all(isinstance(item, dict) for item in pool):
+            updated["pool"] = _rebuild_fingerprint_pool(updated, pool_size=pool_size)
     FINGERPRINT_CACHE.clear()
     FINGERPRINT_CACHE.update(updated)
     write_json_file(FINGERPRINT_CACHE_PATH, FINGERPRINT_CACHE)
@@ -2582,7 +2658,7 @@ def build_websocket_url(url):
 
 
 def build_websocket_headers(account):
-    headers = build_default_desktop_headers()
+    headers = build_default_desktop_headers(account.name)
     headers["OpenAI-Beta"] = "responses_websockets=2026-02-06"
     headers["x-openai-internal-codex-residency"] = "us"
     headers["Authorization"] = f"Bearer {account.access_token()}"
@@ -2591,7 +2667,7 @@ def build_websocket_headers(account):
         headers["Cookie"] = cookie_header
     headers.pop("Content-Type", None)
     headers.pop("Accept", None)
-    return order_headers(headers)
+    return order_headers(headers, account_name=account.name)
 
 
 class WebSocketSSEUpstreamResponse:
@@ -3631,7 +3707,7 @@ def ensure_prompt_cache_key(payload, session_key):
 
 
 def build_upstream_headers(account, session_key):
-    headers = build_default_desktop_headers()
+    headers = build_default_desktop_headers(account.name)
     headers["Content-Type"] = "application/json"
     headers["OpenAI-Beta"] = "responses_websockets=2026-02-06"
     headers["Authorization"] = f"Bearer {account.access_token()}"
@@ -3641,7 +3717,7 @@ def build_upstream_headers(account, session_key):
     if session_key:
         headers["conversation_id"] = session_key
         headers["session_id"] = session_key
-    return order_headers(headers)
+    return order_headers(headers, account_name=account.name)
 
 
 def estimate_text_tokens(text):
@@ -5489,7 +5565,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_json(200, refresh_fingerprint_cache(force=True))
                 return
             if job == "token_refresh":
-                self._write_json(200, {"refreshed": refresh_accounts_if_needed(force=False)})
+                self._write_json(200, {"refreshed": refresh_accounts_if_needed(force=False, refresh_expired=True)})
                 return
             self._write_json(400, {"error": {"type": "invalid_request_error", "message": "unknown runtime job"}})
             return
