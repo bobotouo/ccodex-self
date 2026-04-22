@@ -114,6 +114,20 @@ class ServerlessStateStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_oauth_pkce_sessions_created_at
                     ON oauth_pkce_sessions(created_at);
+                    CREATE TABLE IF NOT EXISTS connector_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        token_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        remote_addr TEXT,
+                        uploaded_entry_id TEXT,
+                        uploaded_email TEXT,
+                        error_text TEXT,
+                        last_seen_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_connector_sessions_expires_at
+                    ON connector_sessions(expires_at);
                     """
                 )
                 cur.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auth_file TEXT")
@@ -555,3 +569,111 @@ class ServerlessStateStore:
         with self._pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM oauth_pkce_sessions WHERE state = %s", (state,))
+
+    # ---- connector sessions ----
+    def create_connector_session(self, session_id: str, *, token_hash: str, expires_at: str, remote_addr: str | None = None, created_at: str | None = None) -> None:
+        created = created_at or _utcnow_iso()
+        if self._backend == "sqlite":
+            account = self._sqlite.get_account("__connector_sessions__") or {}
+            mapping = dict(account.get("metadata") or {})
+            mapping[session_id] = {
+                "session_id": session_id,
+                "token_hash": token_hash,
+                "created_at": created,
+                "expires_at": expires_at,
+                "status": "pending",
+                "remote_addr": remote_addr or "",
+                "uploaded_entry_id": "",
+                "uploaded_email": "",
+                "error_text": "",
+                "last_seen_at": created,
+            }
+            self._sqlite.upsert_account("__connector_sessions__", status="disabled", metadata=mapping, quota={}, usage={})
+            return
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO connector_sessions (
+                        session_id, token_hash, created_at, expires_at, status, remote_addr,
+                        uploaded_entry_id, uploaded_email, error_text, last_seen_at
+                    ) VALUES (%s, %s, %s, %s, 'pending', %s, '', '', '', %s)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        token_hash = EXCLUDED.token_hash,
+                        created_at = EXCLUDED.created_at,
+                        expires_at = EXCLUDED.expires_at,
+                        status = 'pending',
+                        remote_addr = EXCLUDED.remote_addr,
+                        uploaded_entry_id = '',
+                        uploaded_email = '',
+                        error_text = '',
+                        last_seen_at = EXCLUDED.last_seen_at
+                    """,
+                    (session_id, token_hash, created, expires_at, remote_addr or "", created),
+                )
+
+    def get_connector_session(self, session_id: str) -> dict[str, Any] | None:
+        if self._backend == "sqlite":
+            account = self._sqlite.get_account("__connector_sessions__") or {}
+            mapping = dict(account.get("metadata") or {})
+            item = mapping.get(session_id)
+            return dict(item) if isinstance(item, dict) else None
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT session_id, token_hash, created_at, expires_at, status, remote_addr,
+                           uploaded_entry_id, uploaded_email, error_text, last_seen_at
+                    FROM connector_sessions
+                    WHERE session_id = %s
+                    """,
+                    (session_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "session_id": row[0],
+            "token_hash": row[1],
+            "created_at": row[2],
+            "expires_at": row[3],
+            "status": row[4],
+            "remote_addr": row[5],
+            "uploaded_entry_id": row[6],
+            "uploaded_email": row[7],
+            "error_text": row[8],
+            "last_seen_at": row[9],
+        }
+
+    def update_connector_session(self, session_id: str, **fields: Any) -> None:
+        existing = self.get_connector_session(session_id)
+        if not existing:
+            return
+        merged = {**existing, **fields, "last_seen_at": _utcnow_iso()}
+        if self._backend == "sqlite":
+            account = self._sqlite.get_account("__connector_sessions__") or {}
+            mapping = dict(account.get("metadata") or {})
+            mapping[session_id] = merged
+            self._sqlite.upsert_account("__connector_sessions__", status="disabled", metadata=mapping, quota={}, usage={})
+            return
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE connector_sessions
+                    SET status = %s,
+                        uploaded_entry_id = %s,
+                        uploaded_email = %s,
+                        error_text = %s,
+                        last_seen_at = %s
+                    WHERE session_id = %s
+                    """,
+                    (
+                        str(merged.get("status") or "pending"),
+                        str(merged.get("uploaded_entry_id") or ""),
+                        str(merged.get("uploaded_email") or ""),
+                        str(merged.get("error_text") or ""),
+                        str(merged.get("last_seen_at") or _utcnow_iso()),
+                        session_id,
+                    ),
+                )

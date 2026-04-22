@@ -39,6 +39,7 @@ TOKEN_URL = "https://auth.openai.com/oauth/token"
 AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 OAUTH_CALLBACK_TTL_SECONDS = int(os.environ.get("LITE_OAUTH_CALLBACK_TTL_SECONDS", "300") or "300")
 LEGACY_SYNC_INTERVAL_MS = int(os.environ.get("LITE_LEGACY_SYNC_INTERVAL_MS", "800") or "800")
+CONNECTOR_SESSION_TTL_SECONDS = int(os.environ.get("LITE_CONNECTOR_SESSION_TTL_SECONDS", "600") or "600")
 
 # Keep legacy runtime artifacts writable in serverless environment.
 os.environ.setdefault("LITE_RUNTIME_ROOT", "/tmp/codex2gpt-runtime")
@@ -87,6 +88,88 @@ def decode_jwt_payload(token: str) -> dict[str, Any]:
 
 def now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def _iso_after_seconds(seconds: int) -> str:
+    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=max(1, int(seconds)))).isoformat(timespec="seconds")
+
+
+def _parse_iso(value: str) -> datetime.datetime | None:
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value or ""))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _persist_auth_payload(payload: dict[str, Any], *, source: str, entry_id_override: str = "") -> dict[str, Any]:
+    tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
+    id_claims = decode_jwt_payload(str(tokens.get("id_token") or ""))
+    auth_claims = id_claims.get("https://api.openai.com/auth") if isinstance(id_claims.get("https://api.openai.com/auth"), dict) else {}
+    profile = id_claims.get("https://api.openai.com/profile") if isinstance(id_claims.get("https://api.openai.com/profile"), dict) else {}
+
+    entry_id = os.path.basename(entry_id_override or str(payload.get("entry_id") or "")).strip()
+    if not entry_id:
+        raw_email = str(payload.get("email") or id_claims.get("email") or profile.get("email") or "").strip() or "account"
+        safe_email = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in raw_email)
+        entry_id = f"{safe_email}_{secrets.token_hex(6)}.json"
+    if not entry_id.endswith(".json"):
+        entry_id = f"{entry_id}.json"
+
+    email = str(payload.get("email") or id_claims.get("email") or profile.get("email") or "").strip()
+    user_id = str(payload.get("user_id") or id_claims.get("sub") or auth_claims.get("user_id") or "").strip()
+    account_id = str(tokens.get("account_id") or payload.get("account_id") or auth_claims.get("chatgpt_account_id") or "").strip()
+    plan_type = str(payload.get("plan_type") or payload.get("plan") or auth_claims.get("chatgpt_plan_type") or "").strip()
+
+    STATE_DB.upsert_account(
+        entry_id,
+        auth_file=f"db://accounts/{entry_id}",
+        email=email,
+        user_id=user_id,
+        account_id=account_id,
+        plan_type=plan_type,
+        status="active",
+        refresh_token=str(tokens.get("refresh_token") or ""),
+        proxy_id=None,
+        last_error=None,
+        metadata={"source": source, "id_claims": id_claims},
+        quota={},
+        usage={"input_tokens": 0, "output_tokens": 0, "request_count": 0},
+        auth_payload=payload,
+    )
+    return {"entry_id": entry_id, "email": email}
+
+
+def _find_existing_account_entry(payload: dict[str, Any]) -> str:
+    tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
+    refresh_token = str(tokens.get("refresh_token") or "").strip()
+    id_claims = decode_jwt_payload(str(tokens.get("id_token") or ""))
+    auth_claims = id_claims.get("https://api.openai.com/auth") if isinstance(id_claims.get("https://api.openai.com/auth"), dict) else {}
+    profile = id_claims.get("https://api.openai.com/profile") if isinstance(id_claims.get("https://api.openai.com/profile"), dict) else {}
+    user_id = str(payload.get("user_id") or id_claims.get("sub") or auth_claims.get("user_id") or "").strip()
+    account_id = str(tokens.get("account_id") or payload.get("account_id") or auth_claims.get("chatgpt_account_id") or "").strip()
+    email = str(payload.get("email") or id_claims.get("email") or profile.get("email") or "").strip().lower()
+
+    for account in STATE_DB.list_accounts():
+        if not isinstance(account, dict):
+            continue
+        account_user_id = str(account.get("user_id") or "").strip()
+        account_account_id = str(account.get("account_id") or "").strip()
+        account_email = str(account.get("email") or "").strip().lower()
+        account_payload = account.get("auth_payload") if isinstance(account.get("auth_payload"), dict) else {}
+        account_tokens = account_payload.get("tokens") if isinstance(account_payload.get("tokens"), dict) else {}
+        account_refresh = str(account_tokens.get("refresh_token") or "").strip()
+        if refresh_token and account_refresh and refresh_token == account_refresh:
+            return str(account.get("entry_id") or "")
+        if user_id and account_user_id and user_id == account_user_id:
+            return str(account.get("entry_id") or "")
+        if account_id and account_account_id and account_id == account_account_id:
+            return str(account.get("entry_id") or "")
+        if email and account_email and email == account_email:
+            return str(account.get("entry_id") or "")
+    return ""
 
 
 def oauth_redirect_uri_for_request(request: Request) -> str:
@@ -852,33 +935,172 @@ def import_local_accounts(request: Request):
                 payload = json.load(f)
         except Exception:
             continue
-        tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
-        id_claims = decode_jwt_payload(str(tokens.get("id_token") or ""))
-        auth_claims = id_claims.get("https://api.openai.com/auth") if isinstance(id_claims.get("https://api.openai.com/auth"), dict) else {}
-        profile = id_claims.get("https://api.openai.com/profile") if isinstance(id_claims.get("https://api.openai.com/profile"), dict) else {}
-        entry_id = os.path.basename(path)
-        email = str(payload.get("email") or id_claims.get("email") or profile.get("email") or "").strip()
-        user_id = str(payload.get("user_id") or id_claims.get("sub") or auth_claims.get("user_id") or "").strip()
-        account_id = str(tokens.get("account_id") or payload.get("account_id") or auth_claims.get("chatgpt_account_id") or "").strip()
-        plan_type = str(payload.get("plan_type") or payload.get("plan") or auth_claims.get("chatgpt_plan_type") or "").strip()
-        STATE_DB.upsert_account(
-            entry_id,
-            auth_file=path,
-            email=email,
-            user_id=user_id,
-            account_id=account_id,
-            plan_type=plan_type,
-            status="active",
-            refresh_token=str(tokens.get("refresh_token") or ""),
-            proxy_id=None,
-            last_error=None,
-            metadata={"source": "local_import", "id_claims": id_claims},
-            quota={},
-            usage={"input_tokens": 0, "output_tokens": 0, "request_count": 0},
-            auth_payload=payload,
-        )
-        imported.append(entry_id)
+        result = _persist_auth_payload(payload, source="local_import", entry_id_override=os.path.basename(path))
+        imported.append(result["entry_id"])
     return {"imported": imported, "count": len(imported), "auth_dir": auth_dir}
+
+
+@app.post("/admin/connector/session/create")
+async def connector_create_session(request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    payload = await request.json() if request.method == "POST" else {}
+    ttl = int((payload or {}).get("ttl_seconds") or CONNECTOR_SESSION_TTL_SECONDS) if isinstance(payload, dict) else CONNECTOR_SESSION_TTL_SECONDS
+    ttl = max(60, min(ttl, 1800))
+    session_id = secrets.token_hex(8)
+    token = f"c2gcs_{secrets.token_urlsafe(30)}"
+    STATE_DB.create_connector_session(
+        session_id,
+        token_hash=hash_api_key(token),
+        expires_at=_iso_after_seconds(ttl),
+        remote_addr=_client_ip(request),
+    )
+    public_base = (os.environ.get("LITE_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if not public_base:
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+        proto = request.headers.get("x-forwarded-proto") or "https"
+        public_base = f"{proto}://{host}".rstrip("/")
+    install_url = (
+        f"{public_base}/connector/install.sh?token={urllib.parse.quote(token, safe='')}"
+        f"&session_id={urllib.parse.quote(session_id, safe='')}"
+    )
+    return {"ok": True, "session_id": session_id, "expires_in_seconds": ttl, "install_url": install_url, "token": token}
+
+
+@app.get("/admin/connector/session/{session_id}")
+def connector_session_status(session_id: str, request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    session = STATE_DB.get_connector_session(session_id)
+    if not session:
+        return JSONResponse(status_code=404, content={"error": {"type": "not_found", "message": "connector session not found"}})
+    expires_at = _parse_iso(str(session.get("expires_at") or ""))
+    is_expired = bool(expires_at and expires_at <= datetime.datetime.now(datetime.timezone.utc))
+    if is_expired and str(session.get("status") or "pending") == "pending":
+        STATE_DB.update_connector_session(session_id, status="expired")
+        session = STATE_DB.get_connector_session(session_id) or session
+    status = str(session.get("status") or "pending")
+    message = ""
+    if status == "duplicate":
+        message = "账号已存在，已更新该账号认证信息。"
+    elif status == "completed":
+        message = "账号上传成功。"
+    elif status == "failed":
+        message = "上传失败，请重新生成命令后重试。"
+    elif status == "expired":
+        message = "会话已过期，请重新生成命令。"
+    return {
+        "session_id": session_id,
+        "status": status,
+        "expires_at": session.get("expires_at") or "",
+        "uploaded_entry_id": session.get("uploaded_entry_id") or "",
+        "uploaded_email": session.get("uploaded_email") or "",
+        "error": session.get("error_text") or "",
+        "message": message,
+    }
+
+
+@app.get("/connector/install.sh")
+def connector_install_script(request: Request, token: str = "", session_id: str = ""):
+    raw_token = str(token or "").strip()
+    raw_session_id = str(session_id or "").strip()
+    if not raw_token:
+        return Response("missing token\n", status_code=400, media_type="text/plain; charset=utf-8")
+    if not raw_session_id:
+        return Response("missing session_id\n", status_code=400, media_type="text/plain; charset=utf-8")
+    public_base = (os.environ.get("LITE_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if not public_base:
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+        proto = request.headers.get("x-forwarded-proto") or "https"
+        public_base = f"{proto}://{host}".rstrip("/")
+    script = f"""#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_URL="{public_base}"
+TOKEN="{raw_token}"
+SESSION_ID="{raw_session_id}"
+AUTH_PATH="${{AUTH_PATH:-$HOME/.codex/auth.json}}"
+
+if [ ! -f "$AUTH_PATH" ]; then
+  echo "auth file not found: $AUTH_PATH" >&2
+  exit 1
+fi
+
+PAYLOAD="$(python3 - "$TOKEN" "$SESSION_ID" "$AUTH_PATH" <<'PY'
+import json
+import sys
+
+token = sys.argv[1]
+session_id = sys.argv[2]
+auth_path = sys.argv[3]
+with open(auth_path, "r", encoding="utf-8") as f:
+    auth_payload = json.load(f)
+print(json.dumps({{"token": token, "session_id": session_id, "auth_payload": auth_payload}}, separators=(",", ":")))
+PY
+)"
+
+echo "Uploading auth from $AUTH_PATH ..."
+curl -fsS "$BASE_URL/admin/connector/upload-auth" \\
+  -H 'content-type: application/json' \\
+  --data-binary "$PAYLOAD"
+"""
+    return Response(script, media_type="text/x-shellscript; charset=utf-8")
+
+
+@app.post("/admin/connector/upload-auth")
+async def connector_upload_auth(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "message": "request body must be valid json"}})
+    token = str((body.get("token") if isinstance(body, dict) else "") or "").strip()
+    auth_payload = body.get("auth_payload") if isinstance(body, dict) else None
+    if not token:
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "message": "token is required"}})
+    if not isinstance(auth_payload, dict):
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "message": "auth_payload must be object"}})
+    if len(json.dumps(auth_payload, ensure_ascii=False)) > 1024 * 512:
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "message": "auth_payload too large"}})
+
+    token_hash = hash_api_key(token)
+    matched: dict[str, Any] | None = None
+    matched_id = ""
+    session_id = str((body.get("session_id") if isinstance(body, dict) else "") or "").strip()
+    if session_id:
+        item = STATE_DB.get_connector_session(session_id)
+        if item and str(item.get("token_hash") or "") == token_hash:
+            matched = item
+            matched_id = session_id
+    if not matched:
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "message": "invalid or expired token"}})
+    expires_at = _parse_iso(str(matched.get("expires_at") or ""))
+    if not expires_at or expires_at <= datetime.datetime.now(datetime.timezone.utc):
+        STATE_DB.update_connector_session(matched_id, status="expired")
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "message": "token expired"}})
+    if str(matched.get("status") or "pending") != "pending":
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "message": "token already used"}})
+    try:
+        existing_entry = _find_existing_account_entry(auth_payload)
+        is_duplicate = bool(existing_entry)
+        result = _persist_auth_payload(
+            auth_payload,
+            source="connector_upload",
+            entry_id_override=existing_entry,
+        )
+        STATE_DB.update_connector_session(
+            matched_id,
+            status="duplicate" if is_duplicate else "completed",
+            uploaded_entry_id=result["entry_id"],
+            uploaded_email=result["email"],
+            error_text="",
+        )
+    except Exception as exc:
+        STATE_DB.update_connector_session(matched_id, status="failed", error_text=str(exc))
+        return JSONResponse(status_code=400, content={"error": {"type": "invalid_request_error", "message": str(exc)}})
+    _sync_legacy_runtime_state(force=True)
+    return {"ok": True, "entry_id": result["entry_id"], "email": result["email"], "duplicate": bool(existing_entry)}
 
 
 @app.get("/app.js")

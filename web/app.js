@@ -11,6 +11,7 @@ const endpoints = {
   loginStart: "/auth/login-start",
   codeRelay: "/auth/code-relay",
   codexAppSelect: "/auth/codex-app/select",
+  connectorSessionCreate: "/admin/connector/session/create",
 };
 
 const uiState = {
@@ -25,6 +26,7 @@ const uiState = {
   language: "zh-CN",
   data: null,
   authPopup: null,
+  connectorPollTimer: null,
 };
 
 const LANGUAGE_STORAGE_KEY = "codex2gpt.dashboard.language";
@@ -1549,6 +1551,75 @@ async function submitCallbackUrl() {
   }
 }
 
+async function createConnectorSession() {
+  const button = document.querySelector("#create-connector-session");
+  const commandInput = document.querySelector("#connector-command");
+  const output = document.querySelector("#connector-result");
+  if (!button || !commandInput || !output) {
+    return;
+  }
+  button.disabled = true;
+  output.textContent = "正在为本次添加账号生成命令...";
+  commandInput.value = "";
+  try {
+    const result = await postJson(endpoints.connectorSessionCreate, {});
+    if (result?.error) {
+      output.textContent = prettyJson(result);
+      return;
+    }
+    const command = `curl -fsSL "${result.install_url}" | bash`;
+    commandInput.value = command;
+    output.textContent = [
+      "账号添加命令已生成。请发给目标用户在本地终端执行。",
+      `会话 ID: ${result.session_id || ""}`,
+      `有效期: ${result.expires_in_seconds || 0} 秒`,
+      "",
+      "本次会话仅对应一个账号，等待上传结果...",
+    ].join("\n");
+    if (uiState.connectorPollTimer) {
+      window.clearInterval(uiState.connectorPollTimer);
+      uiState.connectorPollTimer = null;
+    }
+    const poll = async () => {
+      try {
+        const status = await loadJson(`/admin/connector/session/${encodeURIComponent(result.session_id || "")}`);
+        if (status?.error) {
+          output.textContent = prettyJson(status);
+          return;
+        }
+        const lines = [
+          `状态: ${status.status || "pending"}`,
+          `过期时间: ${status.expires_at || "-"}`,
+          status.message ? `说明: ${status.message}` : "",
+          status.uploaded_entry_id ? `账号文件: ${status.uploaded_entry_id}` : "",
+          status.uploaded_email ? `邮箱: ${status.uploaded_email}` : "",
+          status.error ? `错误: ${status.error}` : "",
+        ].filter(Boolean);
+        output.textContent = lines.join("\n");
+        if (status.status && status.status !== "pending") {
+          if (uiState.connectorPollTimer) {
+            window.clearInterval(uiState.connectorPollTimer);
+            uiState.connectorPollTimer = null;
+          }
+          if (status.status === "completed" || status.status === "duplicate") {
+            render().catch(() => {});
+          }
+        }
+      } catch (error) {
+        output.textContent = prettyJson({ ok: false, error: String(error) });
+      }
+    };
+    await poll();
+    uiState.connectorPollTimer = window.setInterval(() => {
+      poll().catch(() => {});
+    }, 3000);
+  } catch (error) {
+    output.textContent = prettyJson({ ok: false, error: String(error) });
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function runConnectionTest() {
   const button = document.querySelector("#run-test");
   const output = document.querySelector("#connection-test");
@@ -1691,6 +1762,33 @@ function wireEvents() {
     submitCallbackUrl().catch((error) => {
       setText("#login-result", prettyJson({ ok: false, error: String(error) }));
     });
+  });
+
+  document.querySelector("#create-connector-session")?.addEventListener("click", () => {
+    createConnectorSession().catch((error) => {
+      setText("#connector-result", prettyJson({ ok: false, error: String(error) }));
+    });
+  });
+
+  document.querySelector("#copy-connector-command")?.addEventListener("click", async () => {
+    const commandInput = document.querySelector("#connector-command");
+    const button = document.querySelector("#copy-connector-command");
+    const value = (commandInput && "value" in commandInput ? commandInput.value : "").trim();
+    if (!value || !button) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+      button.textContent = "已复制";
+      window.setTimeout(() => {
+        button.textContent = "复制命令";
+      }, 1200);
+    } catch (error) {
+      button.textContent = "复制失败";
+      window.setTimeout(() => {
+        button.textContent = "复制命令";
+      }, 1200);
+    }
   });
 
   document.querySelector("#runtime-settings")?.addEventListener("submit", (event) => {

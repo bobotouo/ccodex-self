@@ -93,24 +93,18 @@
         <div class="overview-layout">
           <div class="stack-xl">
             <article class="card card-emphasis">
-            <p class="card-kicker" data-i18n="auth.kicker">认证</p>
-            <h2 data-i18n="auth.title">添加账号</h2>
-            <p class="subcopy small" data-i18n-html="auth.subtitle">为另一个 Codex 账号启动浏览器 OAuth 流程。默认会使用 <code>localhost:1455</code> 的本地回调；如果未能自动完成，可以手动粘贴回调 URL。</p>
-            <button id="start-login" class="action" data-i18n="auth.start">添加账号</button>
+            <p class="card-kicker">连接器</p>
+            <h2>添加账号（脚本模式）</h2>
+            <p class="subcopy small">点击“添加账号”会立即生成一条终端命令。每次点击都是一个新的单次会话（对应一个账号）。</p>
+            <button id="create-connector-session" class="action" type="button">添加账号</button>
             <div class="stack">
               <label class="field">
-                <span data-i18n="auth.callbackLabel">手动回调 URL</span>
-                <input
-                  id="callback-url"
-                  name="callback_url"
-                  type="url"
-                  placeholder="如有需要，请粘贴 localhost:1455/auth/callback?... 到这里"
-                  data-i18n-placeholder="auth.callbackPlaceholder"
-                />
+                <span>给用户执行的命令</span>
+                <input id="connector-command" name="connector_command" type="text" readonly placeholder="点击上方按钮后生成" />
               </label>
-              <button id="submit-callback-url" class="action secondary" type="button" data-i18n="auth.complete">完成登录</button>
+              <button id="copy-connector-command" class="action secondary" type="button">复制命令</button>
             </div>
-            <pre id="login-result" data-i18n="common.idle">空闲</pre>
+            <pre id="connector-result" data-i18n="common.idle">空闲</pre>
             </article>
 
             <article class="card card-accent">
