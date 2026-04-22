@@ -5489,7 +5489,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_json(200, refresh_fingerprint_cache(force=True))
                 return
             if job == "token_refresh":
-                self._write_json(200, {"refreshed": refresh_accounts_if_needed(force=True)})
+                self._write_json(200, {"refreshed": refresh_accounts_if_needed(force=False)})
                 return
             self._write_json(400, {"error": {"type": "invalid_request_error", "message": "unknown runtime job"}})
             return
