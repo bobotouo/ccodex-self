@@ -44,8 +44,10 @@ from codex2gpt.state_db import RuntimeStateStore
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RUNTIME_DIR = os.path.join(BASE_DIR, "runtime")
-AUTH_DIR = os.environ.get("LITE_AUTH_DIR", os.path.join(RUNTIME_DIR, "accounts"))
+IS_VERCEL = str(os.environ.get("VERCEL", "")).strip().lower() in {"1", "true", "yes", "on"}
+DEFAULT_RUNTIME_ROOT = "/tmp/codex2gpt-runtime" if IS_VERCEL else os.path.join(BASE_DIR, "runtime")
+RUNTIME_DIR = os.path.abspath(os.environ.get("LITE_RUNTIME_ROOT", DEFAULT_RUNTIME_ROOT))
+AUTH_DIR = os.path.abspath(os.environ.get("LITE_AUTH_DIR", os.path.join(RUNTIME_DIR, "accounts")))
 STATE_ROOT = os.path.abspath(os.environ.get("LITE_RUNTIME_ROOT", os.path.dirname(AUTH_DIR) or RUNTIME_DIR))
 LISTEN_HOST = os.environ.get("LITE_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LITE_PORT", "18100"))
