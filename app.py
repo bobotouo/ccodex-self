@@ -99,6 +99,9 @@ TOKEN_URL = "https://auth.openai.com/oauth/token"
 AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
 QUOTA_URL = "https://chatgpt.com/backend-api/codex/usage"
+MODEL_DISCOVERY_URL = os.environ.get("LITE_MODEL_DISCOVERY_URL", "https://chatgpt.com/backend-api/models").strip()
+MODEL_DISCOVERY_ENABLED = os.environ.get("LITE_MODEL_DISCOVERY_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+MODEL_DISCOVERY_TTL_SECONDS = int(os.environ.get("LITE_MODEL_DISCOVERY_TTL_SECONDS", "120") or "120")
 IPIFY_URL = "https://api.ipify.org?format=json"
 RETRYABLE_STATUS_CODES = {401, 403, 408, 409, 429, 500, 502, 503, 504}
 UPSTREAM_HEADERS = {
@@ -1349,20 +1352,121 @@ def runtime_warning_summary():
     return summary
 
 
+MODEL_DISCOVERY_CACHE = {"models": [], "fetched_at": 0.0}
+MODEL_DISCOVERY_LOCK = threading.RLock()
+
+
+def _extract_model_ids_from_payload(payload):
+    if isinstance(payload, list):
+        raw_models = payload
+    elif isinstance(payload, dict):
+        raw_models = payload.get("data")
+        if not isinstance(raw_models, list):
+            raw_models = payload.get("models")
+        if not isinstance(raw_models, list):
+            raw_models = payload.get("items")
+    else:
+        raw_models = []
+    if not isinstance(raw_models, list):
+        return []
+    model_ids = []
+    seen = set()
+    for item in raw_models:
+        model_id = ""
+        if isinstance(item, str):
+            model_id = item
+        elif isinstance(item, dict):
+            model_id = str(
+                item.get("id")
+                or item.get("slug")
+                or item.get("model")
+                or item.get("name")
+                or ""
+            ).strip()
+        model_id = model_id.strip()
+        if model_id.startswith("models/"):
+            model_id = model_id[len("models/") :]
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        model_ids.append(model_id)
+    return model_ids
+
+
+def discover_upstream_models():
+    if not MODEL_DISCOVERY_ENABLED or not MODEL_DISCOVERY_URL:
+        return []
+    now = time.time()
+    with MODEL_DISCOVERY_LOCK:
+        if MODEL_DISCOVERY_CACHE["models"] and (now - float(MODEL_DISCOVERY_CACHE["fetched_at"] or 0.0) < max(10, MODEL_DISCOVERY_TTL_SECONDS)):
+            return list(MODEL_DISCOVERY_CACHE["models"])
+
+    discovered = []
+    for account in list(pool.accounts):
+        headers = build_default_desktop_headers(account.name)
+        headers["Authorization"] = f"Bearer {account.access_token()}"
+        headers["Accept"] = "application/json"
+        headers.pop("Content-Type", None)
+        cookie_header = account_cookie_header(account.name)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        request = urllib.request.Request(
+            MODEL_DISCOVERY_URL,
+            headers=order_headers(headers, account_name=account.name),
+            method="GET",
+        )
+        proxy_url = resolve_proxy_url_for_account(account.name)
+        try:
+            payload = load_json_with_transport_fallback(request, proxy_url=proxy_url, timeout=30, account_name=account.name)
+        except Exception:
+            continue
+        discovered = _extract_model_ids_from_payload(payload)
+        if discovered:
+            break
+
+    with MODEL_DISCOVERY_LOCK:
+        MODEL_DISCOVERY_CACHE["models"] = list(discovered)
+        MODEL_DISCOVERY_CACHE["fetched_at"] = time.time()
+    return discovered
+
+
 def advertised_model_catalog():
     plans = RUNTIME_SETTINGS.get("plans") if isinstance(RUNTIME_SETTINGS.get("plans"), dict) else {}
-    return [
-        {
-            "id": model,
-            "object": "model",
-            "created": 1738368000,
-            "owned_by": "openai",
-            "type": "model",
-            "display_name": model,
-            "supported_plans": list(plans.get(model) or plans.get(spec["effective_model"]) or []),
-        }
-        for model, spec in advertised_model_entries()
-    ]
+    entries = []
+    seen = set()
+
+    for model, spec in advertised_model_entries():
+        seen.add(model)
+        entries.append(
+            {
+                "id": model,
+                "object": "model",
+                "created": 1738368000,
+                "owned_by": "openai",
+                "type": "model",
+                "display_name": model,
+                "supported_plans": list(plans.get(model) or plans.get(spec["effective_model"]) or []),
+            }
+        )
+
+    # Auto-discover enabled models from OpenAI upstream and expose them directly.
+    for model in discover_upstream_models():
+        if model in seen:
+            continue
+        seen.add(model)
+        entries.append(
+            {
+                "id": model,
+                "object": "model",
+                "created": 1738368000,
+                "owned_by": "openai",
+                "type": "model",
+                "display_name": model,
+                "supported_plans": list(plans.get(model) or []),
+            }
+        )
+
+    return entries
 
 
 def auth_file_metadata(auth_file):
@@ -4470,10 +4574,17 @@ def iter_anthropic_message_sse(upstream, model, include_thinking=False):
 
 
 def parse_auth_header(headers):
-    value = headers.get("authorization", "")
+    value = extract_header_value(headers, "authorization", "proxy-authorization")
     if value.lower().startswith("bearer "):
         return value[7:].strip()
-    return headers.get("x-api-key", "").strip()
+    return extract_header_value(
+        headers,
+        "x-api-key",
+        "api-key",
+        "anthropic-api-key",
+        "x-auth-token",
+        "x-forwarded-api-key",
+    )
 
 
 def hash_api_key(raw_key):
