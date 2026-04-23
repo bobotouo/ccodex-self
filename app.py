@@ -1849,16 +1849,29 @@ def perform_relay_request(provider, codex_payload, *, timeout=120):
 
 
 def fetch_account_quota(account):
-    headers = build_default_desktop_headers(account.name)
-    headers["Authorization"] = f"Bearer {account.access_token()}"
-    headers["Accept"] = "application/json"
-    headers.pop("Content-Type", None)
-    cookie_header = account_cookie_header(account.name)
-    if cookie_header:
-        headers["Cookie"] = cookie_header
-    request = urllib.request.Request(QUOTA_URL, headers=order_headers(headers, account_name=account.name), method="GET")
     proxy_url = resolve_proxy_url_for_account(account.name)
-    payload = load_json_with_transport_fallback(request, proxy_url=proxy_url, timeout=30, account_name=account.name)
+
+    def _build_quota_request():
+        headers = build_default_desktop_headers(account.name)
+        headers["Authorization"] = f"Bearer {account.access_token()}"
+        headers["Accept"] = "application/json"
+        headers.pop("Content-Type", None)
+        cookie_header = account_cookie_header(account.name)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        return urllib.request.Request(QUOTA_URL, headers=order_headers(headers, account_name=account.name), method="GET")
+
+    request = _build_quota_request()
+    try:
+        payload = load_json_with_transport_fallback(request, proxy_url=proxy_url, timeout=30, account_name=account.name)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            raise
+        # Quota endpoint can return 401 right after account import/login; refresh once before marking account expired.
+        account.refresh_access_token()
+        request = _build_quota_request()
+        payload = load_json_with_transport_fallback(request, proxy_url=proxy_url, timeout=30, account_name=account.name)
+
     if not isinstance(payload, dict):
         raise RuntimeError("invalid quota payload from upstream")
     return payload
