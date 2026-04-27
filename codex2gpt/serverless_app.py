@@ -1143,6 +1143,24 @@ def list_api_keys(request: Request, hours: int | None = None):
     return STATE_DB.get_api_key_usage_summary(hours=hours)
 
 
+@app.get("/admin/storage-diagnostics")
+def storage_diagnostics(request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    diagnostics = STATE_DB.storage_diagnostics()
+    diagnostics.update(
+        {
+            "legacy_state_shared": legacy.STATE_DB is STATE_DB
+            or legacy.STATE_DB is getattr(STATE_DB, "_sqlite", None),
+            "legacy_state_type": type(legacy.STATE_DB).__name__,
+            "serverless_state_type": type(STATE_DB).__name__,
+            "legacy_sync_error": _LEGACY_LAST_SYNC_ERROR,
+        }
+    )
+    return diagnostics
+
+
 @app.post("/admin/api-keys")
 async def create_api_key(request: Request):
     reject = _require_dashboard(request)

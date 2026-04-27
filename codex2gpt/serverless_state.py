@@ -10,6 +10,7 @@ import json
 import os
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from codex2gpt import state_db as _state_db
 from codex2gpt.state_db import RuntimeStateStore
@@ -57,6 +58,72 @@ class ServerlessStateStore:
 
     def _pg_conn(self):
         return self._psycopg.connect(self.database_url, autocommit=True)
+
+    def storage_diagnostics(self) -> dict[str, Any]:
+        parsed = urlparse(self.database_url) if self.database_url else None
+        payload: dict[str, Any] = {
+            "backend": self._backend,
+            "database_url_configured": bool(self.database_url),
+            "database_host": parsed.hostname if parsed else "",
+            "database_provider_hint": "neon" if parsed and "neon.tech" in str(parsed.hostname or "") else "",
+            "aux_sqlite_enabled": bool(self._aux is not None),
+        }
+        if self._backend == "sqlite":
+            api_summary = self._sqlite.get_api_key_usage_summary(hours=None)
+            accounts = self._sqlite.list_accounts()
+            payload.update(
+                {
+                    "api_key_count": api_summary.get("key_count", 0),
+                    "api_key_usage_request_count": api_summary.get("total_request_count", 0),
+                    "account_count": len(accounts),
+                    "accounts_with_quota": sum(1 for item in accounts if item.get("quota")),
+                    "accounts_with_usage": sum(1 for item in accounts if item.get("usage")),
+                }
+            )
+            return payload
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM accounts")
+                account_count = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute("SELECT COUNT(*) FROM accounts WHERE quota_json IS NOT NULL AND quota_json <> '{}' AND quota_json <> ''")
+                accounts_with_quota = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute("SELECT COUNT(*) FROM accounts WHERE usage_json IS NOT NULL AND usage_json <> '{}' AND usage_json <> ''")
+                accounts_with_usage = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute("SELECT COUNT(*) FROM api_keys")
+                api_key_count = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute("SELECT COUNT(*), COALESCE(SUM(request_count), 0), MAX(recorded_at) FROM api_key_usage_events")
+                usage_row = cur.fetchone() or [0, 0, None]
+                cur.execute(
+                    """
+                    SELECT key_id, name, key_prefix, enabled, last_used_at
+                    FROM api_keys
+                    ORDER BY created_at DESC, key_id DESC
+                    LIMIT 10
+                    """
+                )
+                key_rows = cur.fetchall()
+        payload.update(
+            {
+                "account_count": account_count,
+                "accounts_with_quota": accounts_with_quota,
+                "accounts_with_usage": accounts_with_usage,
+                "api_key_count": api_key_count,
+                "api_key_usage_event_count": int(usage_row[0] or 0),
+                "api_key_usage_request_count": int(usage_row[1] or 0),
+                "last_api_key_usage_at": usage_row[2],
+                "recent_api_keys": [
+                    {
+                        "key_id": row[0],
+                        "name": row[1],
+                        "key_prefix": row[2],
+                        "enabled": bool(row[3]),
+                        "last_used_at": row[4],
+                    }
+                    for row in key_rows
+                ],
+            }
+        )
+        return payload
 
     def _init_pg_schema(self) -> None:
         with self._pg_conn() as conn:
@@ -290,12 +357,11 @@ class ServerlessStateStore:
     def upsert_account(self, entry_id: str, **fields: Any) -> dict[str, Any]:
         if self._backend == "sqlite":
             return self._sqlite.upsert_account(entry_id, **fields)
+        existing = self.get_account(entry_id) or {}
         now = _utcnow_iso()
         with self._pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT created_at FROM accounts WHERE entry_id = %s", (entry_id,))
-                row = cur.fetchone()
-                created_at = row[0] if row else now
+                created_at = existing.get("created_at") or now
                 cur.execute(
                     """
                     INSERT INTO accounts (
@@ -321,19 +387,19 @@ class ServerlessStateStore:
                     """,
                     (
                         entry_id,
-                        fields.get("auth_file"),
-                        fields.get("email"),
-                        fields.get("user_id"),
-                        fields.get("account_id"),
-                        fields.get("plan_type"),
-                        fields.get("status", "active"),
-                        fields.get("refresh_token"),
-                        fields.get("proxy_id"),
-                        fields.get("last_error"),
-                        _dumps(fields.get("metadata", {})),
-                        _dumps(fields.get("quota", {})),
-                        _dumps(fields.get("usage", {})),
-                        _dumps(fields.get("auth_payload", {})),
+                        fields.get("auth_file", existing.get("auth_file")),
+                        fields.get("email", existing.get("email")),
+                        fields.get("user_id", existing.get("user_id")),
+                        fields.get("account_id", existing.get("account_id")),
+                        fields.get("plan_type", existing.get("plan_type")),
+                        fields.get("status", existing.get("status") or "active"),
+                        fields.get("refresh_token", existing.get("refresh_token")),
+                        fields.get("proxy_id", existing.get("proxy_id")),
+                        fields.get("last_error", existing.get("last_error")),
+                        _dumps(fields.get("metadata", existing.get("metadata") or {})),
+                        _dumps(fields.get("quota", existing.get("quota") or {})),
+                        _dumps(fields.get("usage", existing.get("usage") or {})),
+                        _dumps(fields.get("auth_payload", existing.get("auth_payload") or {})),
                         created_at,
                         now,
                     ),
@@ -411,6 +477,8 @@ class ServerlessStateStore:
                 metadata=metadata,
             )
         now = _utcnow_iso()
+        existing = self.get_api_key(key_id) or {}
+        created_at = existing.get("created_at") or now
         with self._pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -427,7 +495,17 @@ class ServerlessStateStore:
                         metadata_json = EXCLUDED.metadata_json,
                         updated_at = EXCLUDED.updated_at
                     """,
-                    (key_id, name, api_key, key_hash, key_prefix, enabled, _dumps(metadata or {}), now, now),
+                    (
+                        key_id,
+                        name,
+                        api_key,
+                        key_hash,
+                        key_prefix,
+                        enabled,
+                        _dumps(metadata if metadata is not None else (existing.get("metadata") or {})),
+                        created_at,
+                        now,
+                    ),
                 )
                 cur.execute(
                     """
