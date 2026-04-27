@@ -67,6 +67,7 @@ DEFAULT_MODEL = os.environ.get("LITE_MODEL", "gpt-5.4")
 DEFAULT_MODELS_RAW = os.environ.get("LITE_MODELS", "")
 MODEL_OVERRIDES_JSON = os.environ.get("LITE_MODEL_OVERRIDES_JSON", "").strip()
 MODEL_OVERRIDES_PATH = os.path.abspath(os.environ.get("LITE_MODEL_OVERRIDES_PATH", os.path.join(BASE_DIR, "model-overrides.toml")))
+MODEL_ALIAS_JSON = os.environ.get("LITE_MODEL_ALIAS_JSON", "").strip()
 DEFAULT_INSTRUCTIONS = os.environ.get("LITE_INSTRUCTIONS", "You are a helpful coding assistant.")
 DEFAULT_REASONING_EFFORT = os.environ.get("LITE_REASONING_EFFORT", "medium").strip() or "medium"
 DEFAULT_TEXT_VERBOSITY = os.environ.get("LITE_TEXT_VERBOSITY", "high").strip() or "high"
@@ -223,8 +224,30 @@ def load_model_overrides():
 MODEL_OVERRIDES = load_model_overrides()
 
 
+def load_model_aliases():
+    if not MODEL_ALIAS_JSON:
+        return {}
+    try:
+        payload = json.loads(MODEL_ALIAS_JSON)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    aliases = {}
+    for alias, target in payload.items():
+        key = str(alias or "").strip()
+        value = str(target or "").strip()
+        if key and value:
+            aliases[key] = value
+    return aliases
+
+
+MODEL_ALIASES = load_model_aliases()
+
+
 def resolve_model_spec(model_name: Any):
     requested_model = str(model_name or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    requested_model = MODEL_ALIASES.get(requested_model, requested_model)
     override = MODEL_OVERRIDES.get(requested_model)
     if override:
         return {
@@ -257,6 +280,22 @@ def configured_model_overrides_snapshot():
             "advertise": bool(config.get("advertise")),
         }
     return snapshot
+
+
+def normalize_provider_alias_path(path: str):
+    normalized = str(path or "").strip() or "/"
+    prefix = "/api/provider/"
+    if not normalized.startswith(prefix):
+        return normalized, ""
+    tail = normalized[len(prefix) :]
+    if "/" not in tail:
+        return normalized, ""
+    provider, suffix = tail.split("/", 1)
+    provider = str(provider or "").strip()
+    suffix = "/" + str(suffix or "").lstrip("/")
+    if not provider or not suffix.startswith(("/v1/", "/v1beta/")):
+        return normalized, ""
+    return suffix, provider
 
 
 def advertised_model_entries():
@@ -4650,6 +4689,7 @@ class Handler(BaseHTTPRequestHandler):
             "session_key": session_context.get("session_key", ""),
             "client_id": session_context.get("client_id", ""),
             "business_key": session_context.get("business_key", ""),
+            "provider_alias": getattr(self, "_provider_alias", ""),
             "account_name": self._current_account_name(),
             "status": status,
             "request": transcript_request_section(requested_model, payload, raw_payload),
@@ -4665,6 +4705,19 @@ class Handler(BaseHTTPRequestHandler):
         record["response"] = response_section
         self._append_transcript(record)
         usage_payload = response_section.get("usage") if isinstance(response_section, dict) else {}
+        STATE_DB.append_usage_event(
+            request_id=str(record.get("request_id") or ""),
+            account_id=self._current_account_name() or "__unknown__",
+            key_id=(self._api_key_context or {}).get("key_id") or None,
+            model=str(requested_model or ""),
+            status="completed",
+            input_tokens=int(usage_payload.get("input_tokens") or usage_payload.get("prompt_tokens") or 0),
+            output_tokens=int(usage_payload.get("output_tokens") or usage_payload.get("completion_tokens") or 0),
+            request_count=1,
+            source="runtime",
+            recorded_at=record.get("timestamp"),
+            metadata={"path": path, "session_key": session_context.get("session_key", "") if isinstance(session_context, dict) else ""},
+        )
         self._record_api_key_usage(success=True, usage=usage_payload, path=path)
         RECENT_REQUESTS.append(
             recent_request_entry(
@@ -4685,6 +4738,20 @@ class Handler(BaseHTTPRequestHandler):
             "body": transcript_error_body(body),
         }
         self._append_transcript(record)
+        STATE_DB.append_usage_event(
+            request_id=str(record.get("request_id") or ""),
+            account_id=self._current_account_name() or "__unknown__",
+            key_id=(self._api_key_context or {}).get("key_id") or None,
+            model=str(requested_model or ""),
+            status=str(status or "failed"),
+            input_tokens=0,
+            output_tokens=0,
+            request_count=1,
+            error_type=str(error_type or "upstream_error"),
+            source="runtime",
+            recorded_at=record.get("timestamp"),
+            metadata={"path": path, "status_code": status_code},
+        )
         self._record_api_key_usage(success=False, usage={}, path=path, error_type=error_type, status_code=status_code)
         RECENT_REQUESTS.append(
             recent_request_entry(
@@ -4738,6 +4805,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _write_api_json(self, status, *, data=None, meta=None, error=None, extra_headers=None):
+        payload = {
+            "data": data if data is not None else {},
+            "meta": meta if isinstance(meta, dict) else {},
+            "error": error if isinstance(error, dict) else None,
+        }
+        self._write_json(status, payload, extra_headers=extra_headers)
 
     def _write_text(self, status, body, content_type="text/plain; charset=utf-8"):
         if isinstance(body, str):
@@ -4900,7 +4975,9 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(raw.decode() or "{}")
 
     def do_GET(self):
-        path = self._request_path()
+        raw_path = self._request_path()
+        path, provider_alias = normalize_provider_alias_path(raw_path)
+        self._provider_alias = provider_alias
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if path == "/health":
             sync_accounts_with_state()
@@ -5274,6 +5351,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._write_json(200, STATE_DB.get_usage_summary())
             return
+        if path == "/admin/usage/summary":
+            if not self._require_dashboard_access():
+                return
+            hours = query.get("hours", [""])[0]
+            try:
+                hours_value = int(hours) if str(hours).strip() else None
+            except ValueError:
+                hours_value = None
+            snapshot = STATE_DB.get_usage_summary()
+            ledger = STATE_DB.get_usage_event_summary(hours=hours_value)
+            self._write_api_json(
+                200,
+                data={
+                    "source_of_truth": "usage_events",
+                    "ledger": ledger,
+                    "snapshot": snapshot,
+                    "delta": {
+                        "input_tokens": int(ledger.get("total_input_tokens") or 0) - int(snapshot.get("total_input_tokens") or 0),
+                        "output_tokens": int(ledger.get("total_output_tokens") or 0) - int(snapshot.get("total_output_tokens") or 0),
+                        "request_count": int(ledger.get("total_request_count") or 0) - int(snapshot.get("total_request_count") or 0),
+                    },
+                },
+                meta={"hours": hours_value},
+            )
+            return
         if path == "/admin/usage-stats/history":
             if not self._require_dashboard_access():
                 return
@@ -5285,6 +5387,47 @@ class Handler(BaseHTTPRequestHandler):
                 hours_value = 24
             self._write_json(200, {"data": STATE_DB.get_usage_history(hours=hours_value, granularity=granularity)})
             return
+        if path == "/admin/usage/history":
+            if not self._require_dashboard_access():
+                return
+            hours = query.get("hours", ["24"])[0]
+            granularity = query.get("granularity", ["hourly"])[0]
+            try:
+                hours_value = int(hours) if str(hours).strip() else None
+            except ValueError:
+                hours_value = 24
+            source = str((query.get("source") or ["ledger"])[0] or "ledger").strip().lower()
+            rows = (
+                STATE_DB.get_usage_history(hours=hours_value, granularity=granularity)
+                if source == "snapshot"
+                else STATE_DB.get_usage_event_history(hours=hours_value, granularity=granularity)
+            )
+            self._write_api_json(200, data=rows, meta={"hours": hours_value, "granularity": granularity, "source": source})
+            return
+        if path == "/admin/usage/reconcile":
+            if not self._require_dashboard_access():
+                return
+            hours = query.get("hours", ["24"])[0]
+            granularity = query.get("granularity", ["hourly"])[0]
+            try:
+                hours_value = int(hours) if str(hours).strip() else None
+            except ValueError:
+                hours_value = 24
+            rows = STATE_DB.get_usage_reconciliation(hours=hours_value, granularity=granularity)
+            mismatches = sum(1 for item in rows if item.get("mismatch"))
+            self._write_api_json(
+                200,
+                data=rows,
+                meta={"hours": hours_value, "granularity": granularity, "mismatches": mismatches},
+            )
+            return
+        if path == "/admin/accounts/list":
+            if not self._require_dashboard_access():
+                return
+            sync_accounts_with_state()
+            records = STATE_DB.list_accounts()
+            self._write_api_json(200, data=records, meta={"count": len(records)})
+            return
         if path == "/admin/api-keys":
             if not self._require_dashboard_access():
                 return
@@ -5294,6 +5437,17 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 hours_value = None
             self._write_json(200, STATE_DB.get_api_key_usage_summary(hours=hours_value))
+            return
+        if path == "/admin/keys/list":
+            if not self._require_dashboard_access():
+                return
+            hours = query.get("hours", [""])[0]
+            try:
+                hours_value = int(hours) if str(hours).strip() else None
+            except ValueError:
+                hours_value = None
+            payload = STATE_DB.get_api_key_usage_summary(hours=hours_value)
+            self._write_api_json(200, data=payload.get("data") or [], meta={k: v for k, v in payload.items() if k != "data"})
             return
         if path == "/admin/api-keys/usage-history":
             if not self._require_dashboard_access():
@@ -5309,6 +5463,19 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {"data": STATE_DB.get_api_key_usage_history(key_id=key_id or None, hours=hours_value, granularity=granularity)},
             )
+            return
+        if path == "/admin/keys/history":
+            if not self._require_dashboard_access():
+                return
+            key_id = str((query.get("key_id") or [""])[0] or "").strip()
+            hours = query.get("hours", ["24"])[0]
+            granularity = query.get("granularity", ["hourly"])[0]
+            try:
+                hours_value = int(hours) if str(hours).strip() else None
+            except ValueError:
+                hours_value = 24
+            rows = STATE_DB.get_api_key_usage_history(key_id=key_id or None, hours=hours_value, granularity=granularity)
+            self._write_api_json(200, data=rows, meta={"hours": hours_value, "granularity": granularity, "key_id": key_id or None})
             return
         if path.startswith("/auth/accounts/") and path.endswith("/cookies"):
             if not self._require_dashboard_access():
@@ -5364,7 +5531,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._reset_request_tracking()
-        path = self._request_path()
+        raw_path = self._request_path()
+        path, provider_alias = normalize_provider_alias_path(raw_path)
+        self._provider_alias = provider_alias
         if path == "/auth/login":
             size = int(self.headers.get("content-length", "0") or "0")
             raw = self.rfile.read(size).decode("utf-8", errors="replace")
@@ -5665,6 +5834,55 @@ class Handler(BaseHTTPRequestHandler):
                         "created_at": key_record.get("created_at"),
                     },
                 },
+            )
+            return
+
+        if path == "/admin/keys/create":
+            if not self._require_dashboard_access():
+                return
+            payload = self._read_json()
+            name = str((payload.get("name") if isinstance(payload, dict) else "") or "").strip() or "default"
+            key_id = secrets.token_hex(8)
+            raw_key = f"c2g_{secrets.token_urlsafe(24)}"
+            key_record = STATE_DB.upsert_api_key(
+                key_id,
+                name=name,
+                api_key=raw_key,
+                key_hash=hash_api_key(raw_key),
+                key_prefix=raw_key[:10],
+                enabled=True,
+                metadata={"created_by": self._client_ip()},
+            )
+            self._write_api_json(
+                200,
+                data={
+                    "key": raw_key,
+                    "record": {
+                        "key_id": key_record.get("key_id"),
+                        "name": key_record.get("name"),
+                        "key_prefix": key_record.get("key_prefix"),
+                        "enabled": key_record.get("enabled"),
+                        "created_at": key_record.get("created_at"),
+                    },
+                },
+            )
+            return
+
+        if path == "/admin/usage/reconcile":
+            if not self._require_dashboard_access():
+                return
+            payload = self._read_json()
+            hours_raw = payload.get("hours") if isinstance(payload, dict) else 24
+            granularity = str((payload.get("granularity") if isinstance(payload, dict) else "hourly") or "hourly").strip() or "hourly"
+            try:
+                hours = int(hours_raw) if str(hours_raw).strip() else 24
+            except ValueError:
+                hours = 24
+            rows = STATE_DB.reconcile_usage_with_snapshots(hours=hours, granularity=granularity)
+            self._write_api_json(
+                200,
+                data=rows,
+                meta={"hours": hours, "granularity": granularity, "mismatches": sum(1 for item in rows if item.get("mismatch"))},
             )
             return
 
@@ -6499,7 +6717,9 @@ class Handler(BaseHTTPRequestHandler):
         self._write_anthropic_error(exc.code, anthropic_status_error_type(exc.code), message)
 
     def do_DELETE(self):
-        path = self._request_path()
+        raw_path = self._request_path()
+        path, provider_alias = normalize_provider_alias_path(raw_path)
+        self._provider_alias = provider_alias
         if path.startswith("/auth/accounts/") and path.endswith("/cookies"):
             if not self._require_dashboard_access():
                 return
@@ -6531,6 +6751,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             STATE_DB.delete_api_key(key_id)
             self._write_json(200, {"deleted": True, "key_id": key_id})
+            return
+        if path.startswith("/admin/keys/"):
+            if not self._require_dashboard_access():
+                return
+            key_id = urllib.parse.unquote(path[len("/admin/keys/") :]).strip("/")
+            if not key_id:
+                self._write_api_json(400, error={"type": "invalid_request_error", "message": "key_id is required"})
+                return
+            STATE_DB.delete_api_key(key_id)
+            self._write_api_json(200, data={"deleted": True, "key_id": key_id})
             return
         if path == "/auth/login":
             self.send_response(200)

@@ -148,6 +148,57 @@ class RuntimeStateStore:
             CREATE INDEX IF NOT EXISTS idx_usage_snapshots_account_time
             ON usage_snapshots(account_id, captured_at);
 
+            CREATE TABLE IF NOT EXISTS usage_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT,
+                account_id TEXT NOT NULL,
+                key_id TEXT,
+                model TEXT,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                request_count INTEGER NOT NULL DEFAULT 1,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                error_type TEXT,
+                source TEXT NOT NULL DEFAULT 'runtime',
+                recorded_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_request_id
+            ON usage_events(request_id)
+            WHERE request_id IS NOT NULL AND request_id != '';
+
+            CREATE INDEX IF NOT EXISTS idx_usage_events_time
+            ON usage_events(recorded_at);
+
+            CREATE INDEX IF NOT EXISTS idx_usage_events_account_time
+            ON usage_events(account_id, recorded_at);
+
+            CREATE INDEX IF NOT EXISTS idx_usage_events_key_time
+            ON usage_events(key_id, recorded_at);
+
+            CREATE TABLE IF NOT EXISTS usage_reconciliations (
+                account_id TEXT NOT NULL,
+                bucket_start TEXT NOT NULL,
+                granularity TEXT NOT NULL,
+                ledger_input_tokens INTEGER NOT NULL DEFAULT 0,
+                ledger_output_tokens INTEGER NOT NULL DEFAULT 0,
+                ledger_request_count INTEGER NOT NULL DEFAULT 0,
+                snapshot_input_tokens INTEGER NOT NULL DEFAULT 0,
+                snapshot_output_tokens INTEGER NOT NULL DEFAULT 0,
+                snapshot_request_count INTEGER NOT NULL DEFAULT 0,
+                delta_input_tokens INTEGER NOT NULL DEFAULT 0,
+                delta_output_tokens INTEGER NOT NULL DEFAULT 0,
+                delta_request_count INTEGER NOT NULL DEFAULT 0,
+                mismatch INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (account_id, bucket_start, granularity)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_usage_reconciliations_bucket
+            ON usage_reconciliations(bucket_start, granularity);
+
             CREATE TABLE IF NOT EXISTS api_keys (
                 key_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -546,6 +597,254 @@ class RuntimeStateStore:
                 ),
             )
             self._conn.commit()
+
+    def append_usage_event(
+        self,
+        *,
+        request_id: str | None = None,
+        account_id: str,
+        key_id: str | None = None,
+        model: str | None = None,
+        status: str = "unknown",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        request_count: int = 1,
+        latency_ms: int = 0,
+        error_type: str | None = None,
+        source: str = "runtime",
+        recorded_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not account_id:
+            return
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO usage_events (
+                    request_id, account_id, key_id, model, status, input_tokens, output_tokens,
+                    request_count, latency_ms, error_type, source, recorded_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(request_id) DO NOTHING
+                """,
+                (
+                    (request_id or "").strip() or None,
+                    account_id,
+                    (key_id or "").strip() or None,
+                    (model or "").strip() or None,
+                    str(status or "unknown"),
+                    int(input_tokens),
+                    int(output_tokens),
+                    max(0, int(request_count)),
+                    max(0, int(latency_ms)),
+                    (error_type or "").strip() or None,
+                    str(source or "runtime"),
+                    _ensure_iso(recorded_at),
+                    _dumps(metadata or {}),
+                ),
+            )
+            self._conn.commit()
+
+    def get_usage_event_summary(
+        self,
+        *,
+        hours: int | None = None,
+        account_id: str | None = None,
+        key_id: str | None = None,
+    ) -> dict[str, Any]:
+        where: list[str] = []
+        params: list[Any] = []
+        if account_id:
+            where.append("account_id = ?")
+            params.append(account_id)
+        if key_id:
+            where.append("key_id = ?")
+            params.append(key_id)
+        if hours is not None:
+            cutoff = datetime.now(timezone.utc).timestamp() - (max(1, int(hours)) * 3600)
+            where.append("strftime('%s', recorded_at) >= ?")
+            params.append(int(cutoff))
+        sql = "SELECT input_tokens, output_tokens, request_count FROM usage_events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return {
+            "event_count": len(rows),
+            "total_input_tokens": sum(int(row["input_tokens"]) for row in rows),
+            "total_output_tokens": sum(int(row["output_tokens"]) for row in rows),
+            "total_request_count": sum(int(row["request_count"]) for row in rows),
+        }
+
+    def get_usage_event_history(
+        self,
+        *,
+        hours: int | None = 24,
+        granularity: str = "hourly",
+        account_id: str | None = None,
+        key_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if granularity not in {"raw", "hourly", "daily"}:
+            raise ValueError("granularity must be raw, hourly, or daily")
+        where: list[str] = []
+        params: list[Any] = []
+        if account_id:
+            where.append("account_id = ?")
+            params.append(account_id)
+        if key_id:
+            where.append("key_id = ?")
+            params.append(key_id)
+        if hours is not None:
+            cutoff = datetime.now(timezone.utc).timestamp() - (max(1, int(hours)) * 3600)
+            where.append("strftime('%s', recorded_at) >= ?")
+            params.append(int(cutoff))
+        sql = """
+            SELECT account_id, recorded_at AS timestamp, input_tokens, output_tokens, request_count
+            FROM usage_events
+        """
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY recorded_at ASC, event_id ASC"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        payload = [
+            {
+                "account_id": row["account_id"],
+                "timestamp": row["timestamp"],
+                "input_tokens": int(row["input_tokens"]),
+                "output_tokens": int(row["output_tokens"]),
+                "request_count": int(row["request_count"]),
+            }
+            for row in rows
+        ]
+        return self._bucketize(payload, granularity)
+
+    def reconcile_usage_with_snapshots(
+        self,
+        *,
+        hours: int | None = 24,
+        granularity: str = "hourly",
+        account_id: str = "__all__",
+    ) -> list[dict[str, Any]]:
+        ledger_rows = self.get_usage_event_history(hours=hours, granularity=granularity)
+        snapshot_rows = self.get_usage_history(hours=hours, granularity=granularity)
+        ledger_by_ts = {str(item["timestamp"]): item for item in ledger_rows}
+        snapshot_by_ts = {str(item["timestamp"]): item for item in snapshot_rows}
+        timestamps = sorted(set(ledger_by_ts) | set(snapshot_by_ts))
+        results: list[dict[str, Any]] = []
+        now = _utcnow_iso()
+        with self._lock:
+            for ts in timestamps:
+                ledger = ledger_by_ts.get(ts, {})
+                snapshot = snapshot_by_ts.get(ts, {})
+                ledger_input = int(ledger.get("input_tokens") or 0)
+                ledger_output = int(ledger.get("output_tokens") or 0)
+                ledger_requests = int(ledger.get("request_count") or 0)
+                snapshot_input = int(snapshot.get("input_tokens") or 0)
+                snapshot_output = int(snapshot.get("output_tokens") or 0)
+                snapshot_requests = int(snapshot.get("request_count") or 0)
+                delta_input = ledger_input - snapshot_input
+                delta_output = ledger_output - snapshot_output
+                delta_requests = ledger_requests - snapshot_requests
+                mismatch = int(any((delta_input, delta_output, delta_requests)))
+                row_payload = {
+                    "account_id": account_id,
+                    "bucket_start": ts,
+                    "granularity": granularity,
+                    "ledger_input_tokens": ledger_input,
+                    "ledger_output_tokens": ledger_output,
+                    "ledger_request_count": ledger_requests,
+                    "snapshot_input_tokens": snapshot_input,
+                    "snapshot_output_tokens": snapshot_output,
+                    "snapshot_request_count": snapshot_requests,
+                    "delta_input_tokens": delta_input,
+                    "delta_output_tokens": delta_output,
+                    "delta_request_count": delta_requests,
+                    "mismatch": bool(mismatch),
+                    "updated_at": now,
+                }
+                results.append(row_payload)
+                self._conn.execute(
+                    """
+                    INSERT INTO usage_reconciliations (
+                        account_id, bucket_start, granularity,
+                        ledger_input_tokens, ledger_output_tokens, ledger_request_count,
+                        snapshot_input_tokens, snapshot_output_tokens, snapshot_request_count,
+                        delta_input_tokens, delta_output_tokens, delta_request_count,
+                        mismatch, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id, bucket_start, granularity) DO UPDATE SET
+                        ledger_input_tokens = excluded.ledger_input_tokens,
+                        ledger_output_tokens = excluded.ledger_output_tokens,
+                        ledger_request_count = excluded.ledger_request_count,
+                        snapshot_input_tokens = excluded.snapshot_input_tokens,
+                        snapshot_output_tokens = excluded.snapshot_output_tokens,
+                        snapshot_request_count = excluded.snapshot_request_count,
+                        delta_input_tokens = excluded.delta_input_tokens,
+                        delta_output_tokens = excluded.delta_output_tokens,
+                        delta_request_count = excluded.delta_request_count,
+                        mismatch = excluded.mismatch,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        account_id,
+                        ts,
+                        granularity,
+                        ledger_input,
+                        ledger_output,
+                        ledger_requests,
+                        snapshot_input,
+                        snapshot_output,
+                        snapshot_requests,
+                        delta_input,
+                        delta_output,
+                        delta_requests,
+                        mismatch,
+                        now,
+                    ),
+                )
+            self._conn.commit()
+        return results
+
+    def get_usage_reconciliation(
+        self,
+        *,
+        hours: int | None = 24,
+        granularity: str = "hourly",
+        account_id: str = "__all__",
+    ) -> list[dict[str, Any]]:
+        where = ["account_id = ?", "granularity = ?"]
+        params: list[Any] = [account_id, granularity]
+        if hours is not None:
+            cutoff = datetime.now(timezone.utc).timestamp() - (max(1, int(hours)) * 3600)
+            where.append("strftime('%s', bucket_start) >= ?")
+            params.append(int(cutoff))
+        sql = """
+            SELECT *
+            FROM usage_reconciliations
+            WHERE """ + " AND ".join(where) + """
+            ORDER BY bucket_start ASC
+        """
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [
+            {
+                "account_id": row["account_id"],
+                "timestamp": row["bucket_start"],
+                "granularity": row["granularity"],
+                "ledger_input_tokens": int(row["ledger_input_tokens"]),
+                "ledger_output_tokens": int(row["ledger_output_tokens"]),
+                "ledger_request_count": int(row["ledger_request_count"]),
+                "snapshot_input_tokens": int(row["snapshot_input_tokens"]),
+                "snapshot_output_tokens": int(row["snapshot_output_tokens"]),
+                "snapshot_request_count": int(row["snapshot_request_count"]),
+                "delta_input_tokens": int(row["delta_input_tokens"]),
+                "delta_output_tokens": int(row["delta_output_tokens"]),
+                "delta_request_count": int(row["delta_request_count"]),
+                "mismatch": bool(row["mismatch"]),
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
 
     def get_usage_summary(self) -> dict[str, Any]:
         with self._lock:
