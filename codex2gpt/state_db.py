@@ -617,17 +617,22 @@ class RuntimeStateStore:
     ) -> None:
         if not account_id:
             return
+        rid = (request_id or "").strip() or None
         with self._lock:
+            # 部分唯一索引不能用于 ON CONFLICT(request_id)；改为先查重
+            if rid and self._conn.execute(
+                "SELECT 1 FROM usage_events WHERE request_id = ? LIMIT 1", (rid,)
+            ).fetchone():
+                return
             self._conn.execute(
                 """
                 INSERT INTO usage_events (
                     request_id, account_id, key_id, model, status, input_tokens, output_tokens,
                     request_count, latency_ms, error_type, source, recorded_at, metadata_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(request_id) DO NOTHING
                 """,
                 (
-                    (request_id or "").strip() or None,
+                    rid,
                     account_id,
                     (key_id or "").strip() or None,
                     (model or "").strip() or None,

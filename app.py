@@ -53,6 +53,8 @@ LISTEN_HOST = os.environ.get("LITE_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LITE_PORT", "18100"))
 API_KEY = os.environ.get("LITE_API_KEY", "")
 API_KEY_REQUIRED = os.environ.get("LITE_API_KEY_REQUIRED", "0").strip().lower() in {"1", "true", "yes", "on"}
+# 环境变量 LITE_API_KEY 在 api_keys 表中的合成 key_id；key_hash 使用独立命名空间，避免与托管 Key 的 SHA256 唯一约束冲突
+ENV_LITE_API_KEY_KEY_ID = "env_lite_api_key"
 STATE_DB_PATH = os.path.abspath(os.environ.get("LITE_STATE_DB", os.path.join(STATE_ROOT, "state.sqlite3")))
 COOKIES_PATH = os.path.abspath(os.environ.get("LITE_COOKIES_PATH", os.path.join(STATE_ROOT, "cookies.json")))
 FINGERPRINT_CACHE_PATH = os.path.abspath(
@@ -4630,6 +4632,30 @@ def hash_api_key(raw_key):
     return hashlib.sha256(str(raw_key or "").encode("utf-8")).hexdigest()
 
 
+def synthetic_env_api_key_key_hash() -> str:
+    if not API_KEY:
+        return ""
+    return f"env_synthetic:{hash_api_key(API_KEY)}"
+
+
+def ensure_synthetic_env_api_key_row() -> None:
+    if not API_KEY:
+        return
+    key_hash = synthetic_env_api_key_key_hash()
+    if not key_hash:
+        return
+    key_prefix = (API_KEY[:12] + "…") if len(API_KEY) > 12 else (API_KEY or "env")
+    STATE_DB.upsert_api_key(
+        ENV_LITE_API_KEY_KEY_ID,
+        name="LITE_API_KEY (环境变量)",
+        api_key="",
+        key_hash=key_hash,
+        key_prefix=key_prefix,
+        enabled=True,
+        metadata={"synthetic": True, "source": "env"},
+    )
+
+
 def summarize_usage_tokens(usage):
     usage = usage if isinstance(usage, dict) else {}
     input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
@@ -4911,11 +4937,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _record_api_key_usage(self, *, success, usage, path="", error_type="", status_code=None):
         context = getattr(self, "_api_key_context", {}) or {}
-        if context.get("source") != "managed" or not context.get("key_id"):
+        if context.get("source") not in ("managed", "env"):
+            return
+        key_id = str(context.get("key_id") or "").strip()
+        if not key_id:
+            return
+        if context.get("source") == "env" and not API_KEY:
             return
         input_tokens, output_tokens = summarize_usage_tokens(usage)
         STATE_DB.record_api_key_usage(
-            context["key_id"],
+            key_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             request_count=1,
@@ -4928,9 +4959,17 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
+    def _apply_resolved_api_key_context(self, context):
+        src = str(context.get("source") or "none")
+        key_id = str(context.get("key_id") or "")
+        if context.get("ok") and src == "env" and API_KEY:
+            ensure_synthetic_env_api_key_row()
+            key_id = ENV_LITE_API_KEY_KEY_ID
+        self._api_key_context = {"source": src, "key_id": key_id}
+
     def _require_api_key(self):
         context = self._resolve_api_key_context()
-        self._api_key_context = {"source": context.get("source"), "key_id": context.get("key_id", "")}
+        self._apply_resolved_api_key_context(context)
         if context.get("ok"):
             return True
         if context.get("source") == "missing":
@@ -4944,7 +4983,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _require_api_key_anthropic(self):
         context = self._resolve_api_key_context()
-        self._api_key_context = {"source": context.get("source"), "key_id": context.get("key_id", "")}
+        self._apply_resolved_api_key_context(context)
         if context.get("ok"):
             return True
         if context.get("source") == "missing":

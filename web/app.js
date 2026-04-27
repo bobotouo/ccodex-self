@@ -4,7 +4,7 @@ const endpoints = {
   rotation: "/admin/rotation-settings",
   usage: "/admin/usage-stats/summary",
   apiKeys: "/admin/api-keys",
-  /** 不要用 quota=fresh：每次打开面板会全量打上游，容易限流且状态不准；账号池展示用缓存即可 */
+  /** 常规拉取为缓存；首次本会话加载用 quota=fresh 预填一次额度，避免长期「无数据」；后台定时/运维按钮仍会刷新 */
   accounts: "/auth/accounts",
   proxies: "/api/proxies",
   relays: "/api/relay-providers",
@@ -31,6 +31,18 @@ const uiState = {
 };
 
 const LANGUAGE_STORAGE_KEY = "codex2gpt.dashboard.language";
+const QUOTA_PREWARM_SESSION_KEY = "c2g_quota_prewarm_done";
+
+function accountsLoadUrl() {
+  try {
+    if (!window.sessionStorage.getItem(QUOTA_PREWARM_SESSION_KEY)) {
+      return `${endpoints.accounts}?quota=fresh`;
+    }
+  } catch {
+    // ignore
+  }
+  return endpoints.accounts;
+}
 
 const TRANSLATIONS = {
   "zh-CN": {
@@ -1346,7 +1358,11 @@ function renderApiKeys(apiKeysPayload) {
             <span>Success: ${escapeHtml(formatNumber(item.success_count || 0))} | Failed: ${escapeHtml(formatNumber(item.failure_count || 0))}</span>
             <span>Last Used: ${escapeHtml(formatDateTime(item.last_used_at || ""))}</span>
             <div class="meta-row">
-              <button class="action secondary" type="button" data-api-key-delete="${escapeHtml(item.key_id)}">删除</button>
+              ${
+                item.key_id === "env_lite_api_key"
+                  ? ""
+                  : `<button class="action secondary" type="button" data-api-key-delete="${escapeHtml(item.key_id)}">删除</button>`
+              }
             </div>
           </article>
         `,
@@ -1462,18 +1478,26 @@ async function loadDashboardData() {
     uiState.usageGranularity,
   )}&hours=${encodeURIComponent(String(uiState.usageHours))}`;
   const apiKeysUrl = `${endpoints.apiKeys}?hours=${encodeURIComponent(String(uiState.usageHours))}`;
+  const accUrl = accountsLoadUrl();
   const [status, runtime, rotation, usage, apiKeys, accounts, proxies, relays, usageHistory, recentRequests] = await Promise.all([
     loadJson(endpoints.status),
     loadJson(endpoints.runtime),
     loadJson(endpoints.rotation),
     loadJson(endpoints.usage),
     loadJson(apiKeysUrl),
-    loadJson(endpoints.accounts),
+    loadJson(accUrl),
     loadJson(endpoints.proxies),
     loadJson(endpoints.relays),
     loadJson(keyHistoryUrl),
     loadJson(endpoints.recentRequests),
   ]);
+  if (accUrl.includes("quota=fresh")) {
+    try {
+      window.sessionStorage.setItem(QUOTA_PREWARM_SESSION_KEY, "1");
+    } catch {
+      // ignore
+    }
+  }
   uiState.lastRefreshAt = new Date().toISOString();
   uiState.data = { status, runtime, rotation, usage, apiKeys, accounts, proxies, relays, usageHistory, recentRequests };
   return uiState.data;

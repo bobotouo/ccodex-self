@@ -380,6 +380,38 @@ class Codex2GptCompatibilityTests(unittest.TestCase):
         finally:
             restore_auth_dir(tempdir, original_auth_dir)
 
+    def test_env_lite_api_key_usage_recorded_in_key_ledger(self):
+        env_key = "c2g_env_ledger_key_only"
+        app, tempdir, original_auth_dir = load_app_module({"LITE_API_KEY": env_key})
+        try:
+            response_payload = {
+                "id": "resp_test",
+                "created_at": 1773667000,
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            }
+            with run_test_server(app, fetch_response=response_payload) as base_url:
+                body = json.dumps({"model": "gpt-5.4", "messages": [{"role": "user", "content": "hi"}]}).encode("utf-8")
+                req_ok = urllib.request.Request(
+                    f"{base_url}/v1/chat/completions",
+                    data=body,
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {env_key}"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_ok, timeout=5) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(payload["object"], "chat.completion")
+
+            summary = app.STATE_DB.get_api_key_usage_summary(hours=None)
+            self.assertEqual(summary["total_request_count"], 1)
+            by_id = {row["key_id"]: row for row in summary.get("data") or []}
+            self.assertIn("env_lite_api_key", by_id)
+            self.assertEqual(int(by_id["env_lite_api_key"]["request_count"] or 0), 1)
+        finally:
+            restore_auth_dir(tempdir, original_auth_dir)
+
     def test_forced_api_key_mode_rejects_when_no_key_configured(self):
         app, tempdir, original_auth_dir = load_app_module({"LITE_API_KEY": None, "LITE_API_KEY_REQUIRED": "1"})
         try:
