@@ -268,6 +268,24 @@ def _sync_db_accounts_to_legacy_runtime() -> None:
     for account in STATE_DB.list_accounts():
         entry_id = os.path.basename(str(account.get("entry_id") or "")).strip()
         payload = account.get("auth_payload")
+        if not isinstance(payload, dict) or not payload:
+            refresh_token = str(account.get("refresh_token") or "").strip()
+            if refresh_token:
+                # Older PG upsert logic could wipe auth_payload_json while leaving refresh_token.
+                # Rebuild enough auth JSON for OAuthAccount.access_token() to refresh a new access token.
+                payload = {
+                    "auth_mode": "chatgpt",
+                    "email": str(account.get("email") or ""),
+                    "user_id": str(account.get("user_id") or ""),
+                    "account_id": str(account.get("account_id") or ""),
+                    "plan_type": str(account.get("plan_type") or ""),
+                    "tokens": {
+                        "refresh_token": refresh_token,
+                        "account_id": str(account.get("account_id") or ""),
+                    },
+                    "last_refresh": str(account.get("updated_at") or ""),
+                }
+                STATE_DB.upsert_account(entry_id, auth_payload=payload)
         if not entry_id or not isinstance(payload, dict) or not payload:
             continue
         target = os.path.join(legacy.AUTH_DIR, entry_id)

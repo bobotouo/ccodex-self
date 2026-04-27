@@ -1563,6 +1563,7 @@ def sync_accounts_with_state():
                 metadata={**(existing.get("metadata") or {}), **(account.get("metadata") or {}), "raw_keys": sorted(raw_payload.keys())},
                 quota=existing.get("quota") or {},
                 usage=existing.get("usage") or {"input_tokens": 0, "output_tokens": 0, "request_count": 0},
+                auth_payload=raw_payload,
             )
             seen.add(account["entry_id"])
     return seen
@@ -1593,6 +1594,7 @@ def record_account_usage(account_name, response):
         metadata=existing.get("metadata") or {},
         quota=existing.get("quota") or {},
         usage=current_usage,
+        auth_payload=existing.get("auth_payload") or {},
     )
     STATE_DB.append_usage_snapshot(
         account_name,
@@ -1621,6 +1623,7 @@ def set_account_status(account_name, status, *, last_error=None):
         metadata=existing.get("metadata") or {},
         quota=existing.get("quota") or {},
         usage=existing.get("usage") or {},
+        auth_payload=existing.get("auth_payload") or {},
     )
 
 
@@ -1662,6 +1665,7 @@ def update_account_record(entry_id, **updates):
         metadata=updates.get("metadata", existing.get("metadata") or {}),
         quota=updates.get("quota", existing.get("quota") or {}),
         usage=updates.get("usage", existing.get("usage") or {}),
+        auth_payload=updates.get("auth_payload", existing.get("auth_payload") or {}),
     )
 
 
@@ -2130,6 +2134,7 @@ def refresh_account_quota(account):
     raw_quota = fetch_account_quota(account)
     summary = extract_quota_summary(raw_quota)
     existing = STATE_DB.get_account(account.name) or {}
+    auth_payload = read_json_file(account.auth_file, {})
     update_account_record(
         account.name,
         email=summary.get("email") or existing.get("email"),
@@ -2137,7 +2142,9 @@ def refresh_account_quota(account):
         account_id=summary.get("account_id") or existing.get("account_id"),
         plan_type=summary.get("plan_type") or existing.get("plan_type"),
         status="rate_limited" if summary.get("limit_reached") else "active",
+        refresh_token=(auth_tokens_from_payload(auth_payload).get("refresh_token") if isinstance(auth_payload, dict) else "") or existing.get("refresh_token"),
         quota=summary,
+        auth_payload=auth_payload if isinstance(auth_payload, dict) else existing.get("auth_payload") or {},
         last_error=None,
     )
     update_quota_warning_state(account.name, summary)
@@ -4945,19 +4952,52 @@ class Handler(BaseHTTPRequestHandler):
         if context.get("source") == "env" and not API_KEY:
             return
         input_tokens, output_tokens = summarize_usage_tokens(usage)
+        request_count = 0 if context.get("request_precounted") else 1
+        if request_count <= 0 and input_tokens <= 0 and output_tokens <= 0:
+            return
         STATE_DB.record_api_key_usage(
             key_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            request_count=1,
+            request_count=request_count,
             success=bool(success),
             metadata={
                 "path": path,
                 "account_name": self._current_account_name(),
                 "error_type": error_type,
                 "status_code": status_code,
+                "phase": "final" if context.get("request_precounted") else "single",
             },
         )
+
+    def _should_count_api_key_request_start(self):
+        path = self._request_path()
+        return path in {
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1beta/models/generateContent",
+        } or path.startswith("/v1beta/models/") or path.startswith("/api/provider/")
+
+    def _record_api_key_request_start(self):
+        context = getattr(self, "_api_key_context", {}) or {}
+        if context.get("request_precounted") or not self._should_count_api_key_request_start():
+            return
+        if context.get("source") not in ("managed", "env"):
+            return
+        key_id = str(context.get("key_id") or "").strip()
+        if not key_id:
+            return
+        STATE_DB.record_api_key_usage(
+            key_id,
+            input_tokens=0,
+            output_tokens=0,
+            request_count=1,
+            success=True,
+            metadata={"path": self._request_path(), "phase": "start"},
+        )
+        context["request_precounted"] = True
+        self._api_key_context = context
 
     def _apply_resolved_api_key_context(self, context):
         src = str(context.get("source") or "none")
@@ -4965,12 +5005,13 @@ class Handler(BaseHTTPRequestHandler):
         if context.get("ok") and src == "env" and API_KEY:
             ensure_synthetic_env_api_key_row()
             key_id = ENV_LITE_API_KEY_KEY_ID
-        self._api_key_context = {"source": src, "key_id": key_id}
+        self._api_key_context = {"source": src, "key_id": key_id, "request_precounted": False}
 
     def _require_api_key(self):
         context = self._resolve_api_key_context()
         self._apply_resolved_api_key_context(context)
         if context.get("ok"):
+            self._record_api_key_request_start()
             return True
         if context.get("source") == "missing":
             self._write_json(
@@ -4985,6 +5026,7 @@ class Handler(BaseHTTPRequestHandler):
         context = self._resolve_api_key_context()
         self._apply_resolved_api_key_context(context)
         if context.get("ok"):
+            self._record_api_key_request_start()
             return True
         if context.get("source") == "missing":
             self._write_json(401, anthropic_error_payload("authentication_error", "api key required; no api key configured"))
