@@ -51,6 +51,14 @@ os.environ.setdefault("LITE_FINGERPRINT_CACHE_PATH", "/tmp/codex2gpt-runtime/fin
 
 import app as legacy
 
+# 与 import app 时创建的 legacy.STATE_DB 解耦，否则记用量/刷账号走「桥接」的 sqlite、读显式 /admin 走另一份，控制台永远 0/无数据。
+# - 仅本机 state.sqlite3：与 Serverless 内嵌的 RuntimeStateStore 共享同一对象。
+# - 已设 DATABASE_URL：让 legacy 与 ServerlessStateStore 为同一对象（含 PG + aux sqlite，见 serverless_state）。
+if getattr(STATE_DB, "_sqlite", None) is not None:
+    legacy.STATE_DB = STATE_DB._sqlite
+elif getattr(STATE_DB, "backend", None) == "postgres":
+    legacy.STATE_DB = STATE_DB
+
 _LEGACY_SYNC_LOCK = threading.RLock()
 _LEGACY_LAST_SYNC_MONO = 0.0
 _LEGACY_LAST_SYNC_ERROR = ""

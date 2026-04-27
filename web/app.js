@@ -676,27 +676,57 @@ function statusTone(status) {
   return "";
 }
 
+/**
+ * 与 app.py 中 quota_used_percent_fraction 一致：>1 视为 0..100 的「百分数」；否则视为 0..1 分位。
+ * 与 extract_quota_summary 存库结构配合：优先后端写入的 quota.used_percent，避免空对象 primary_window 抢优先级。
+ */
+function normalizeQuotaUsedPercentValue(raw) {
+  if (raw === undefined || raw === null || raw === "") {
+    return { value: null, valid: false };
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    return { value: null, valid: false };
+  }
+  let fraction = n;
+  if (fraction > 1) {
+    fraction /= 100.0;
+  }
+  fraction = Math.max(0, Math.min(1, fraction));
+  return { value: Math.round(fraction * 100), valid: true };
+}
+
 function quotaSummary(account) {
   const quota = account?.quota || {};
   const limit = quota?.rate_limit || {};
-  const primary = limit?.primary_window || limit;
+  const rawPrimaryWindow = limit?.primary_window;
+  const primaryWindowIsEmpty =
+    !rawPrimaryWindow || typeof rawPrimaryWindow !== "object" || !Object.keys(rawPrimaryWindow).length;
+  const primary = primaryWindowIsEmpty ? limit : rawPrimaryWindow;
   const secondary = quota?.secondary_rate_limit || limit?.secondary_window || {};
-  const usedPercentRaw = primary?.used_percent ?? quota?.used_percent ?? limit?.used_percent;
-  const secondaryUsedPercentRaw = secondary?.used_percent;
-  const usedPercent = Number(usedPercentRaw);
-  const secondaryUsedPercent = Number(secondaryUsedPercentRaw);
-  const isValid = Number.isFinite(usedPercent);
-  const isSecondaryValid = Number.isFinite(secondaryUsedPercent);
-  const tone = !isValid ? "" : usedPercent >= 90 ? "danger" : usedPercent >= 60 ? "warn" : "";
+  const usedPercentRaw = quota?.used_percent ?? primary?.used_percent ?? limit?.used_percent;
+  const secondaryRaw = secondary?.used_percent;
+  const p = normalizeQuotaUsedPercentValue(usedPercentRaw);
+  const s = normalizeQuotaUsedPercentValue(secondaryRaw);
+  const usedPercent = p.valid ? p.value : null;
+  const secondaryUsedPercent = s.valid ? s.value : null;
+  const tone =
+    !p.valid
+      ? ""
+      : usedPercent >= 90
+        ? "danger"
+        : usedPercent >= 60
+          ? "warn"
+          : "";
   return {
-    usedPercent: isValid ? Math.max(0, Math.min(100, Math.round(usedPercent * (usedPercent > 1 ? 1 : 100)))) : null,
-    secondaryUsedPercent: isSecondaryValid
-      ? Math.max(0, Math.min(100, Math.round(secondaryUsedPercent * (secondaryUsedPercent > 1 ? 1 : 100))))
-      : null,
+    usedPercent,
+    secondaryUsedPercent: s.valid ? s.value : null,
     tone,
-    resetAt: primary?.reset_at || limit?.reset_at || "",
-    resetAfterSeconds: primary?.reset_after_seconds ?? quota?.reset_after_seconds ?? limit?.reset_after_seconds ?? "",
-    limitWindowSeconds: primary?.limit_window_seconds ?? quota?.limit_window_seconds ?? limit?.limit_window_seconds ?? "",
+    resetAt: primary?.reset_at || quota?.reset_at || limit?.reset_at || "",
+    resetAfterSeconds:
+      primary?.reset_after_seconds ?? quota?.reset_after_seconds ?? limit?.reset_after_seconds ?? "",
+    limitWindowSeconds:
+      primary?.limit_window_seconds ?? quota?.limit_window_seconds ?? limit?.limit_window_seconds ?? "",
     secondaryResetAt: secondary?.reset_at || "",
     secondaryResetAfterSeconds: secondary?.reset_after_seconds ?? "",
     secondaryLimitWindowSeconds: secondary?.limit_window_seconds ?? "",

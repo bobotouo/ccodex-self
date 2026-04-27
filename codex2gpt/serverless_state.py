@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from codex2gpt import state_db as _state_db
 from codex2gpt.state_db import RuntimeStateStore
 
 
@@ -34,12 +35,21 @@ class ServerlessStateStore:
             self._backend = "postgres"
             self._init_pg_schema()
             self._sqlite = None
+            # 全量 state_db 能力（usage_events、proxies 等）仍由本地 sqlite 承载，与 Vercel Postgres 中的
+            # accounts/api_keys 并存；legacy 桥与显式 /admin 必须共享同一状态对象，见 serverless_app 绑定。
+            runtime_root = os.path.abspath(os.environ.get("LITE_RUNTIME_ROOT", "/tmp/codex2gpt-runtime"))
+            os.makedirs(runtime_root, exist_ok=True)
+            aux_path = os.path.abspath(
+                os.environ.get("LITE_AUX_STATE_DB", os.path.join(runtime_root, "aux_state.sqlite3"))
+            )
+            self._aux = RuntimeStateStore(aux_path)
         else:
             runtime_root = os.path.abspath(os.environ.get("LITE_RUNTIME_ROOT", "/tmp/codex2gpt-runtime"))
             state_db_path = os.path.abspath(os.environ.get("LITE_STATE_DB", os.path.join(runtime_root, "state.sqlite3")))
             self._sqlite = RuntimeStateStore(state_db_path)
             self._backend = "sqlite"
             self._psycopg = None
+            self._aux = None
 
     @property
     def backend(self) -> str:
@@ -240,6 +250,43 @@ class ServerlessStateStore:
             )
         return result
 
+    def get_account(self, entry_id: str) -> dict[str, Any] | None:
+        if self._backend == "sqlite":
+            return self._sqlite.get_account(entry_id)
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        entry_id, auth_file, email, user_id, account_id, plan_type, status,
+                        refresh_token, proxy_id, last_error, metadata_json, quota_json, usage_json,
+                        auth_payload_json, created_at, updated_at
+                    FROM accounts WHERE entry_id = %s
+                    """,
+                    (entry_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "entry_id": row[0],
+            "auth_file": row[1],
+            "email": row[2],
+            "user_id": row[3],
+            "account_id": row[4],
+            "plan_type": row[5],
+            "status": row[6],
+            "refresh_token": row[7],
+            "proxy_id": row[8],
+            "last_error": row[9],
+            "metadata": json.loads(row[10] or "{}"),
+            "quota": json.loads(row[11] or "{}"),
+            "usage": json.loads(row[12] or "{}"),
+            "auth_payload": json.loads(row[13] or "{}"),
+            "created_at": row[14],
+            "updated_at": row[15],
+        }
+
     def upsert_account(self, entry_id: str, **fields: Any) -> dict[str, Any]:
         if self._backend == "sqlite":
             return self._sqlite.upsert_account(entry_id, **fields)
@@ -297,11 +344,15 @@ class ServerlessStateStore:
     def list_proxies(self) -> list[dict[str, Any]]:
         if self._backend == "sqlite":
             return self._sqlite.list_proxies()
+        if self._aux is not None:
+            return self._aux.list_proxies()
         return []
 
     def list_relay_providers(self, enabled_only: bool = False) -> list[dict[str, Any]]:
         if self._backend == "sqlite":
             return self._sqlite.list_relay_providers(enabled_only=enabled_only)
+        if self._aux is not None:
+            return self._aux.list_relay_providers(enabled_only=enabled_only)
         return []
 
     # ---- api keys ----
@@ -407,6 +458,112 @@ class ServerlessStateStore:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM api_keys WHERE key_id = %s", (key_id,))
 
+    def get_api_key(self, key_id: str) -> dict[str, Any] | None:
+        if self._backend == "sqlite":
+            return self._sqlite.get_api_key(key_id)
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT key_id, name, api_key, key_hash, key_prefix, enabled, metadata_json, last_used_at, created_at, updated_at
+                    FROM api_keys WHERE key_id = %s
+                    """,
+                    (key_id,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "key_id": row[0],
+            "name": row[1],
+            "api_key": row[2],
+            "key_hash": row[3],
+            "key_prefix": row[4],
+            "enabled": bool(row[5]),
+            "metadata": json.loads(row[6] or "{}"),
+            "last_used_at": row[7],
+            "created_at": row[8],
+            "updated_at": row[9],
+        }
+
+    def get_api_key_by_hash(self, key_hash: str) -> dict[str, Any] | None:
+        if self._backend == "sqlite":
+            return self._sqlite.get_api_key_by_hash(key_hash)
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT key_id, name, api_key, key_hash, key_prefix, enabled, metadata_json, last_used_at, created_at, updated_at
+                    FROM api_keys WHERE key_hash = %s
+                    """,
+                    (key_hash,),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "key_id": row[0],
+            "name": row[1],
+            "api_key": row[2],
+            "key_hash": row[3],
+            "key_prefix": row[4],
+            "enabled": bool(row[5]),
+            "metadata": json.loads(row[6] or "{}"),
+            "last_used_at": row[7],
+            "created_at": row[8],
+            "updated_at": row[9],
+        }
+
+    def record_api_key_usage(
+        self,
+        key_id: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        request_count: int = 1,
+        success: bool = True,
+        recorded_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self._backend == "sqlite":
+            return self._sqlite.record_api_key_usage(
+                key_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                request_count=request_count,
+                success=success,
+                recorded_at=recorded_at,
+                metadata=metadata,
+            )
+        ts = _state_db._ensure_iso(recorded_at)
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO api_key_usage_events (
+                        key_id, recorded_at, input_tokens, output_tokens, request_count, success_count, failure_count, metadata_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        key_id,
+                        ts,
+                        int(input_tokens),
+                        int(output_tokens),
+                        max(0, int(request_count)),
+                        max(0, int(request_count)) if success else 0,
+                        max(0, int(request_count)) if not success else 0,
+                        _dumps(metadata or {}),
+                    ),
+                )
+                cur.execute(
+                    """
+                    UPDATE api_keys
+                    SET last_used_at = %s, updated_at = %s
+                    WHERE key_id = %s
+                    """,
+                    (ts, _utcnow_iso(), key_id),
+                )
+
     def get_api_key_usage_summary(self, *, hours: int | None = None) -> dict[str, Any]:
         if self._backend == "sqlite":
             return self._sqlite.get_api_key_usage_summary(hours=hours)
@@ -464,6 +621,95 @@ class ServerlessStateStore:
             "total_failure_count": sum(item["failure_count"] for item in data),
             "data": data,
         }
+
+    @staticmethod
+    def _bucketize_api_key_rows(
+        rows: list[Any],
+        granularity: str,
+    ) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            recorded_at = str(row[1] or "")
+            ts = _state_db._parse_iso(recorded_at)
+            if ts is None:
+                continue
+            if granularity == "raw":
+                bucket = ts.replace(microsecond=0)
+            elif granularity == "hourly":
+                bucket = ts.replace(minute=0, second=0, microsecond=0)
+            else:
+                bucket = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+            key = bucket.isoformat(timespec="seconds")
+            if key not in grouped:
+                grouped[key] = {
+                    "timestamp": key,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "request_count": 0,
+                    "success_count": 0,
+                    "failure_count": 0,
+                }
+            grouped[key]["input_tokens"] += int(row[2] or 0)
+            grouped[key]["output_tokens"] += int(row[3] or 0)
+            grouped[key]["request_count"] += int(row[4] or 0)
+            grouped[key]["success_count"] += int(row[5] or 0)
+            grouped[key]["failure_count"] += int(row[6] or 0)
+        return [grouped[k] for k in sorted(grouped)]
+
+    def get_api_key_usage_history(
+        self,
+        *,
+        key_id: str | None = None,
+        hours: int | None = 24,
+        granularity: str = "hourly",
+    ) -> list[dict[str, Any]]:
+        if self._backend == "sqlite":
+            return self._sqlite.get_api_key_usage_history(
+                key_id=key_id, hours=hours, granularity=granularity
+            )
+        if granularity not in {"raw", "hourly", "daily"}:
+            raise ValueError("granularity must be raw, hourly, or daily")
+        where: list[str] = []
+        params: list[Any] = []
+        if key_id:
+            where.append("key_id = %s")
+            params.append(key_id)
+        if hours is not None:
+            cutoff = datetime.now(timezone.utc).timestamp() - (max(1, int(hours)) * 3600)
+            where.append("EXTRACT(EPOCH FROM (recorded_at::timestamptz)) >= %s")
+            params.append(int(cutoff))
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+            SELECT key_id, recorded_at, input_tokens, output_tokens, request_count, success_count, failure_count
+            FROM api_key_usage_events{where_sql}
+            ORDER BY recorded_at ASC, event_id ASC
+        """
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+        return self._bucketize_api_key_rows(list(rows), granularity)
+
+    def delete_account(self, entry_id: str) -> None:
+        if self._backend == "sqlite":
+            self._sqlite.delete_account(entry_id)
+            return
+        with self._pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM accounts WHERE entry_id = %s", (entry_id,))
+        if self._aux is not None:
+            self._aux.delete_account(entry_id)
+
+    def close(self) -> None:
+        if self._backend == "sqlite" and self._sqlite is not None:
+            self._sqlite.close()
+        if self._aux is not None:
+            self._aux.close()
+
+    def __getattr__(self, name: str) -> Any:
+        if self._backend == "postgres" and self._aux is not None and not name.startswith("_"):
+            return getattr(self._aux, name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     # ---- oauth pkce sessions ----
     def upsert_oauth_pkce_session(self, state: str, *, verifier: str, redirect_uri: str, created_at: str | None = None, completed: bool = False) -> None:
