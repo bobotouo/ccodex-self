@@ -4,7 +4,8 @@ const endpoints = {
   rotation: "/admin/rotation-settings",
   usage: "/admin/usage-stats/summary",
   apiKeys: "/admin/api-keys",
-  accounts: "/auth/accounts?quota=fresh",
+  /** 不要用 quota=fresh：每次打开面板会全量打上游，容易限流且状态不准；账号池展示用缓存即可 */
+  accounts: "/auth/accounts",
   proxies: "/api/proxies",
   relays: "/api/relay-providers",
   recentRequests: "/admin/recent-requests?limit=12",
@@ -790,25 +791,30 @@ function renderWarningBanner(status) {
   );
 }
 
-function applySummary(status, runtime, usage, accountsPayload, proxiesPayload, relaysPayload, recentRequestsPayload) {
+function applySummary(status, runtime, usage, accountsPayload, proxiesPayload, relaysPayload, recentRequestsPayload, apiKeysPayload) {
   const summary = summarizeStatus(status, runtime);
   const accounts = accountsPayload.data || [];
   const proxies = proxiesPayload.data || [];
   const relayProviders = relaysPayload.data || [];
   const recentRequests = recentRequestsPayload.data || [];
+  const keyStats = apiKeysPayload && typeof apiKeysPayload === "object" ? apiKeysPayload : {};
   const activeAccounts = accounts.filter((account) => account.status === "active").length;
   const unhealthyProxies = proxies.filter((proxy) => proxy.status && proxy.status !== "active").length;
   const websocketLabel = summary.websocket_transport_available ? (uiState.language === "en" ? "ready" : "就绪") : (uiState.language === "en" ? "fallback" : "回退");
   const latestRequest = recentRequests[0] || null;
 
-  setText("#stat-accounts", String(summary.accounts ?? 0));
-  setText("#stat-accounts-meta", t("summary.active", { count: activeAccounts }));
-  setText("#stat-warnings", String(summary.warnings?.total ?? 0));
-  setText("#stat-warnings-meta", t("summary.critical", { count: summary.warnings?.critical ?? 0 }));
-  setText("#stat-transport", String(summary.transport_backend ?? "-"));
-  setText("#stat-transport-meta", t("summary.websocket", { state: websocketLabel }));
-  setText("#stat-responses-transport", String(summary.responses_transport ?? "-"));
-  setText("#stat-responses-transport-meta", t("summary.relayProviders", { count: relayProviders.length }));
+  /** 顶部指标：以「对外 API Key = 一个用户」的累计用量为准，避免与池内 GPT 账号状态混淆 */
+  setText("#stat-accounts", String(keyStats.key_count ?? 0));
+  setText(
+    "#stat-accounts-meta",
+    uiState.language === "en" ? `active keys ${keyStats.active_key_count ?? 0}` : `活跃 Key ${keyStats.active_key_count ?? 0}`,
+  );
+  setText("#stat-warnings", formatNumber(keyStats.total_request_count || 0));
+  setText("#stat-warnings-meta", uiState.language === "en" ? "requests (all keys)" : "对外总请求数");
+  setText("#stat-transport", formatNumber(keyStats.total_input_tokens || 0));
+  setText("#stat-transport-meta", uiState.language === "en" ? "key input tokens" : "Key 输入 tokens");
+  setText("#stat-responses-transport", formatNumber(keyStats.total_output_tokens || 0));
+  setText("#stat-responses-transport-meta", uiState.language === "en" ? "key output tokens" : "Key 输出 tokens");
 
   setHtml(
     "#runtime-badges",
@@ -847,6 +853,17 @@ function applySummary(status, runtime, usage, accountsPayload, proxiesPayload, r
 
   renderWarningBanner(status);
   renderApiConfig();
+
+  if ((keyStats.key_count === 0 || keyStats.key_count === undefined) && !k?.total_request_count) {
+    setText("#stat-accounts", String(summary.accounts ?? 0));
+    setText("#stat-accounts-meta", t("summary.active", { count: activeAccounts }));
+    setText("#stat-warnings", String(summary.warnings?.total ?? 0));
+    setText("#stat-warnings-meta", t("summary.critical", { count: summary.warnings?.critical ?? 0 }));
+    setText("#stat-transport", String(summary.transport_backend ?? "-"));
+    setText("#stat-transport-meta", t("summary.websocket", { state: websocketLabel }));
+    setText("#stat-responses-transport", String(summary.responses_transport ?? "-"));
+    setText("#stat-responses-transport-meta", t("summary.relayProviders", { count: relayProviders.length }));
+  }
 }
 
 function applySettings(rotation) {
@@ -1338,11 +1355,16 @@ function renderApiKeys(apiKeysPayload) {
   );
 }
 
-function applyUsageSummary(usage) {
-  setText("#usage-total-input", formatNumber(usage.total_input_tokens || 0));
-  setText("#usage-total-output", formatNumber(usage.total_output_tokens || 0));
-  setText("#usage-total-requests", formatNumber(usage.total_request_count || 0));
-  setText("#usage-account-count", formatNumber(usage.account_count || 0));
+function applyUsageSummary(usage, apiKeysSummary) {
+  const k = apiKeysSummary && typeof apiKeysSummary === "object" ? apiKeysSummary : null;
+  const hasKeyTotals = k && (k.total_request_count !== undefined || k.key_count !== undefined);
+  setText("#usage-total-input", formatNumber(hasKeyTotals ? k.total_input_tokens || 0 : usage.total_input_tokens || 0));
+  setText("#usage-total-output", formatNumber(hasKeyTotals ? k.total_output_tokens || 0 : usage.total_output_tokens || 0));
+  setText("#usage-total-requests", formatNumber(hasKeyTotals ? k.total_request_count || 0 : usage.total_request_count || 0));
+  setText(
+    "#usage-account-count",
+    formatNumber(hasKeyTotals ? k.key_count || 0 : usage.account_count || 0),
+  );
 }
 
 function renderUsageFeed(points) {
@@ -1436,19 +1458,20 @@ function renderUsageChart(points) {
 }
 
 async function loadDashboardData() {
-  const historyUrl = `/admin/usage-stats/history?granularity=${encodeURIComponent(uiState.usageGranularity)}&hours=${encodeURIComponent(
-    String(uiState.usageHours),
-  )}`;
+  const keyHistoryUrl = `/admin/api-keys/usage-history?granularity=${encodeURIComponent(
+    uiState.usageGranularity,
+  )}&hours=${encodeURIComponent(String(uiState.usageHours))}`;
+  const apiKeysUrl = `${endpoints.apiKeys}?hours=${encodeURIComponent(String(uiState.usageHours))}`;
   const [status, runtime, rotation, usage, apiKeys, accounts, proxies, relays, usageHistory, recentRequests] = await Promise.all([
     loadJson(endpoints.status),
     loadJson(endpoints.runtime),
     loadJson(endpoints.rotation),
     loadJson(endpoints.usage),
-    loadJson(endpoints.apiKeys),
+    loadJson(apiKeysUrl),
     loadJson(endpoints.accounts),
     loadJson(endpoints.proxies),
     loadJson(endpoints.relays),
-    loadJson(historyUrl),
+    loadJson(keyHistoryUrl),
     loadJson(endpoints.recentRequests),
   ]);
   uiState.lastRefreshAt = new Date().toISOString();
@@ -1459,7 +1482,7 @@ async function loadDashboardData() {
 function renderDashboard() {
   const { status, runtime, rotation, usage, apiKeys, accounts, proxies, relays, usageHistory, recentRequests } = uiState.data;
   applyViewFromHash();
-  applySummary(status, runtime, usage, accounts, proxies, relays, recentRequests);
+  applySummary(status, runtime, usage, accounts, proxies, relays, recentRequests, apiKeys);
   applySettings(rotation);
   renderWarnings(accounts);
   renderRecentRequests(recentRequests);
@@ -1468,7 +1491,7 @@ function renderDashboard() {
   renderProxies(proxies);
   renderProxyAssignments(accounts);
   renderRelays(relays);
-  applyUsageSummary(usage);
+  applyUsageSummary(usage, apiKeys);
   renderUsageControls();
   renderUsageFeed(usageHistory.data || []);
   renderUsageChart(usageHistory.data || []);
@@ -1699,11 +1722,13 @@ async function refreshUsage() {
     await render();
     return;
   }
-  const historyUrl = `/admin/usage-stats/history?granularity=${encodeURIComponent(uiState.usageGranularity)}&hours=${encodeURIComponent(
-    String(uiState.usageHours),
-  )}`;
+  const keyHistoryUrl = `/admin/api-keys/usage-history?granularity=${encodeURIComponent(
+    uiState.usageGranularity,
+  )}&hours=${encodeURIComponent(String(uiState.usageHours))}`;
+  const apiKeysUrl = `${endpoints.apiKeys}?hours=${encodeURIComponent(String(uiState.usageHours))}`;
   uiState.data.usage = await loadJson(endpoints.usage);
-  uiState.data.usageHistory = await loadJson(historyUrl);
+  uiState.data.apiKeys = await loadJson(apiKeysUrl);
+  uiState.data.usageHistory = await loadJson(keyHistoryUrl);
   renderDashboard();
 }
 

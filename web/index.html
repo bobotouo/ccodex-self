@@ -263,22 +263,22 @@
           <article class="stat">
             <span class="stat-label" data-i18n="usage.inputTokens">输入 Tokens</span>
             <strong id="usage-total-input">-</strong>
-            <span class="stat-meta" data-i18n="usage.latestTotal">已追踪账号的最新总量</span>
+            <span class="stat-meta" id="usage-meta-ledger">对外 API Key 时间窗内合计</span>
           </article>
           <article class="stat">
             <span class="stat-label" data-i18n="usage.outputTokens">输出 Tokens</span>
             <strong id="usage-total-output">-</strong>
-            <span class="stat-meta" data-i18n="usage.latestTotal">已追踪账号的最新总量</span>
+            <span class="stat-meta" id="usage-meta-ledger-2">对外 API Key 时间窗内合计</span>
           </article>
           <article class="stat">
             <span class="stat-label" data-i18n="usage.requests">请求数</span>
             <strong id="usage-total-requests">-</strong>
-            <span class="stat-meta" data-i18n="usage.latestTotal">已追踪账号的最新总量</span>
+            <span class="stat-meta" id="usage-meta-ledger-3">对外 API Key 时间窗内合计</span>
           </article>
           <article class="stat">
-            <span class="stat-label" data-i18n="usage.trackedAccounts">已追踪账号</span>
+            <span class="stat-label" id="usage-keycount-label" data-i18n="usage.trackedAccounts">已注册 Key 数</span>
             <strong id="usage-account-count">-</strong>
-            <span class="stat-meta" data-i18n="usage.trackedAccountsMeta">已有用量快照记录的账号</span>
+            <span class="stat-meta" id="usage-meta-ledger-4">与上方 Token/请求 同源（Key 级统计）</span>
           </article>
         </section>
 
@@ -306,6 +306,6 @@
         </div>
       </section>
     </main>
-    <script type="module" src="/dashboard.js"></script>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>
