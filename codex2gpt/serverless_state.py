@@ -89,6 +89,8 @@ class ServerlessStateStore:
                 accounts_with_quota = int((cur.fetchone() or [0])[0] or 0)
                 cur.execute("SELECT COUNT(*) FROM accounts WHERE usage_json IS NOT NULL AND usage_json <> '{}' AND usage_json <> ''")
                 accounts_with_usage = int((cur.fetchone() or [0])[0] or 0)
+                cur.execute("SELECT COUNT(*) FROM accounts WHERE auth_payload_json IS NOT NULL AND auth_payload_json <> '{}' AND auth_payload_json <> ''")
+                accounts_with_auth_payload = int((cur.fetchone() or [0])[0] or 0)
                 cur.execute("SELECT COUNT(*) FROM api_keys")
                 api_key_count = int((cur.fetchone() or [0])[0] or 0)
                 cur.execute("SELECT COUNT(*), COALESCE(SUM(request_count), 0), MAX(recorded_at) FROM api_key_usage_events")
@@ -107,6 +109,7 @@ class ServerlessStateStore:
                 "account_count": account_count,
                 "accounts_with_quota": accounts_with_quota,
                 "accounts_with_usage": accounts_with_usage,
+                "accounts_with_auth_payload": accounts_with_auth_payload,
                 "api_key_count": api_key_count,
                 "api_key_usage_event_count": int(usage_row[0] or 0),
                 "api_key_usage_request_count": int(usage_row[1] or 0),

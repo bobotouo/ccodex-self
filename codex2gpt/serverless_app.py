@@ -1156,9 +1156,55 @@ def storage_diagnostics(request: Request):
             "legacy_state_type": type(legacy.STATE_DB).__name__,
             "serverless_state_type": type(STATE_DB).__name__,
             "legacy_sync_error": _LEGACY_LAST_SYNC_ERROR,
+            "env_api_key_configured": bool(API_KEY),
+            "legacy_env_api_key_configured": bool(getattr(legacy, "API_KEY", "")),
+            "env_synthetic_key_present": bool(STATE_DB.get_api_key(getattr(legacy, "ENV_LITE_API_KEY_KEY_ID", "env_lite_api_key"))),
         }
     )
     return diagnostics
+
+
+@app.post("/admin/runtime-jobs/run")
+async def run_runtime_job(request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    payload = await request.json()
+    job = str((payload.get("job") if isinstance(payload, dict) else "") or "").strip()
+    _sync_legacy_runtime_state(
+        session_id=request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(),
+        remote_addr=_client_ip(request),
+        force=True,
+    )
+    if job == "quota_refresh":
+        result = legacy.refresh_all_account_quotas()
+        result["storage"] = STATE_DB.storage_diagnostics()
+        return result
+    if job == "token_refresh":
+        return {"refreshed": legacy.refresh_accounts_if_needed(force=False, refresh_expired=True)}
+    if job == "proxy_health":
+        return {"data": [legacy.proxy_health_check(proxy) for proxy in STATE_DB.list_proxies()]}
+    if job == "fingerprint_refresh":
+        return legacy.refresh_fingerprint_cache(force=True)
+    return JSONResponse(
+        status_code=400,
+        content={"error": {"type": "invalid_request_error", "message": "unknown runtime job"}},
+    )
+
+
+@app.post("/admin/quota-refresh")
+def run_quota_refresh(request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    _sync_legacy_runtime_state(
+        session_id=request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(),
+        remote_addr=_client_ip(request),
+        force=True,
+    )
+    result = legacy.refresh_all_account_quotas()
+    result["storage"] = STATE_DB.storage_diagnostics()
+    return result
 
 
 @app.post("/admin/api-keys")
