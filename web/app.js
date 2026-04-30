@@ -189,6 +189,8 @@ const TRANSLATIONS = {
     "api.anthropicMessages": "Anthropic Messages",
     "api.gemini": "Gemini",
     "api.codexResponses": "Codex Responses",
+    "api.mcp": "MCP (OpenCode)",
+    "api.mcpHint": "在 .opencode.json 中配置: {\"mcpServers\":{\"image-gen\":{\"type\":\"stdio\",\"command\":\"python3\",\"args\":[\"scripts/mcp_image_gen.py\"],\"env\":{\"IMAGE_GEN_URL\":\"<上方地址>\",\"IMAGE_SAVE_DIR\":\"~/generated_images\"}}}",
     "codexApp.noMatchedAccount": "未匹配到本地账号",
     "codexApp.authFile": "认证文件",
     "codexApp.currentAccount": "当前账号",
@@ -442,6 +444,8 @@ const TRANSLATIONS = {
     "api.anthropicMessages": "Anthropic Messages",
     "api.gemini": "Gemini",
     "api.codexResponses": "Codex Responses",
+    "api.mcp": "MCP (OpenCode)",
+    "api.mcpHint": "Configure in .opencode.json: {\"mcpServers\":{\"image-gen\":{\"type\":\"stdio\",\"command\":\"python3\",\"args\":[\"scripts/mcp_image_gen.py\"],\"env\":{\"IMAGE_GEN_URL\":\"<baseUrl>\",\"IMAGE_SAVE_DIR\":\"~/generated_images\"}}}",
     "codexApp.noMatchedAccount": "No matched local account",
     "codexApp.authFile": "Auth File",
     "codexApp.currentAccount": "Current Account",
@@ -1011,6 +1015,12 @@ function renderApiConfig() {
       label: t("api.codexResponses"),
       path: `${baseUrl}/v1/responses`,
       snippet: `curl ${baseUrl}/v1/responses`,
+    },
+    {
+      label: t("api.mcp"),
+      path: `${baseUrl}/mcp/sse`,
+      snippet: `curl ${baseUrl}/mcp/sse`,
+      hint: t("api.mcpHint"),
     },
   ];
 

@@ -6661,14 +6661,33 @@ class Handler(BaseHTTPRequestHandler):
                                     "choices": [{"index": 0, "message": {"role": "assistant", "content": content_text}, "finish_reason": "stop"}],
                                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                                 })
+                            self._record_completed_transcript(
+                                path,
+                                session_context,
+                                requested_model_name,
+                                payload,
+                                raw_payload,
+                                transcript_response_section_for_chat_completion({
+                                    "choices": [{"message": {"role": "assistant", "content": content_text}}],
+                                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                                }),
+                            )
                             return
                         except Exception as exc:
                             last_error = exc
                             pool.mark_failure(account.name, str(exc))
                             continue
                     self._write_json(502, {"error": {"type": "upstream_error", "message": str(last_error or "all accounts failed")}})
+                    self._record_failed_transcript(
+                        path, session_context, requested_model_name, payload, raw_payload,
+                        "proxy_error", "upstream_error", str(last_error or "all accounts failed"), 502,
+                    )
                 except Exception as exc:
                     self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
+                    self._record_failed_transcript(
+                        path, session_context, requested_model_name, payload, raw_payload,
+                        "proxy_error", "upstream_error", str(exc), 502,
+                    )
                 return
 
             estimated_tokens, budget_spec, budget_error = validate_context_budget(
@@ -6806,14 +6825,26 @@ class Handler(BaseHTTPRequestHandler):
                         pool.mark_success(account.name)
                         record_image_usage(account.name)
                         self._write_json(200, result)
+                        self._record_completed_transcript(
+                            path, {}, model, {"input": [{"role": "user", "content": prompt}]}, raw_payload,
+                            {"response_id": "", "output_text": "Image generated", "tool_calls": [], "usage": {}, "response_payload": result},
+                        )
                         return
                     except Exception as exc:
                         last_error = exc
                         pool.mark_failure(account.name, str(exc))
                         continue
                 self._write_json(502, {"error": {"type": "upstream_error", "message": str(last_error or "all accounts failed")}})
+                self._record_failed_transcript(
+                    path, {}, model, {"input": [{"role": "user", "content": prompt}]}, raw_payload,
+                    "proxy_error", "upstream_error", str(last_error or "all accounts failed"), 502,
+                )
             except Exception as exc:
                 self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
+                self._record_failed_transcript(
+                    path, {}, model, {"input": [{"role": "user", "content": prompt}]}, raw_payload,
+                    "proxy_error", "upstream_error", str(exc), 502,
+                )
             return
 
         if path != "/v1/responses":

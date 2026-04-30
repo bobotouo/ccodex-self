@@ -1430,3 +1430,185 @@ async def legacy_fallback(path: str, request: Request):
         passthrough_headers.setdefault(key, value)
     return Response(content=bridge.response_body, status_code=bridge.response_status, headers=passthrough_headers)
 
+
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) SSE endpoint for OpenCode integration
+# ---------------------------------------------------------------------------
+
+_mcp_sessions: dict[str, queue.Queue] = {}
+_mcp_sessions_lock = threading.Lock()
+
+
+def _mcp_new_session_id() -> str:
+    return secrets.token_hex(16)
+
+
+MCP_TOOL_DEF = {
+    "name": "generate_image",
+    "description": "Generate an image from a text prompt. Returns a URL path to the saved image. To save the image to a local file, use bash: curl -o <target_path> '<server_url><returned_url>'",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The text prompt describing the image to generate",
+            },
+            "n": {
+                "type": "integer",
+                "description": "Number of images to generate (1-4, default 1)",
+                "default": 1,
+            },
+            "size": {
+                "type": "string",
+                "description": "Image size, e.g. 1024x1024, 1024x1792, 1792x1024",
+                "default": "1024x1024",
+            },
+        },
+        "required": ["prompt"],
+    },
+}
+
+
+def _mcp_jsonrpc_result(request_id: Any, result: Any) -> dict:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _mcp_jsonrpc_error(request_id: Any, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def _mcp_handle_message(body: dict) -> dict | None:
+    method = body.get("method")
+    request_id = body.get("id")
+    params = body.get("params") or {}
+
+    if method == "initialize":
+        return _mcp_jsonrpc_result(request_id, {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "codex2gpt", "version": "1.0.0"},
+        })
+
+    if method == "notifications/initialized":
+        return None
+
+    if method == "tools/list":
+        return _mcp_jsonrpc_result(request_id, {"tools": [MCP_TOOL_DEF]})
+
+    if method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if tool_name != "generate_image":
+            return _mcp_jsonrpc_error(request_id, -32602, f"Unknown tool: {tool_name}")
+        return _mcp_handle_generate_image(request_id, arguments)
+
+    return _mcp_jsonrpc_error(request_id, -32601, f"Method not found: {method}")
+
+
+def _mcp_handle_generate_image(request_id: Any, arguments: dict) -> dict:
+    prompt = str(arguments.get("prompt") or "").strip()
+    if not prompt:
+        return _mcp_jsonrpc_error(request_id, -32602, "prompt is required")
+    n = max(1, min(4, int(arguments.get("n") or 1)))
+    size = str(arguments.get("size") or "1024x1024")
+
+    if not getattr(legacy, "IMAGE_GENERATION_ENABLED", False):
+        return _mcp_jsonrpc_error(request_id, -32000, "Image generation is not enabled")
+    pool = getattr(legacy, "pool", None)
+    if pool is None:
+        return _mcp_jsonrpc_error(request_id, -32000, "Account pool not available")
+
+    accounts = pool.candidates("", "gpt-image-2")
+    if not accounts:
+        return _mcp_jsonrpc_error(request_id, -32000, "No available accounts")
+
+    ConversationBackendClient = legacy.ConversationBackendClient
+    resolve_proxy_url_for_account = legacy.resolve_proxy_url_for_account
+    record_image_usage = legacy.record_image_usage
+    IMAGE_CACHE = getattr(legacy, "IMAGE_CACHE", None)
+
+    last_error = None
+    for account in accounts:
+        try:
+            proxy_url = resolve_proxy_url_for_account(account.name)
+            client = ConversationBackendClient(
+                access_token=account.access_token(),
+                proxy_url=proxy_url,
+                account_name=account.name,
+            )
+            result = client.generate_image_b64(prompt, n=n, size=size, model="gpt-image-2")
+            pool.mark_success(account.name)
+            record_image_usage(account.name)
+
+            saved_urls = []
+            for item in (result.get("data") or []):
+                b64 = str(item.get("b64_json") or "")
+                if not b64:
+                    continue
+                if IMAGE_CACHE:
+                    img_bytes = base64.b64decode(b64)
+                    rel_url = IMAGE_CACHE.save(img_bytes)
+                    saved_urls.append(rel_url)
+                else:
+                    saved_urls.append("(cache disabled, no URL available)")
+
+            if saved_urls:
+                text = "Image generated. URLs:\n" + "\n".join(saved_urls)
+            else:
+                text = "Image generation completed but no data returned."
+            return _mcp_jsonrpc_result(request_id, {
+                "content": [{"type": "text", "text": text}],
+                "isError": False,
+            })
+
+        except Exception as exc:
+            last_error = exc
+            pool.mark_failure(account.name, str(exc))
+            continue
+
+    return _mcp_jsonrpc_error(request_id, -32000, str(last_error or "all accounts failed"))
+
+
+@app.get("/mcp/sse")
+async def mcp_sse(request: Request):
+    session_id = _mcp_new_session_id()
+    q: queue.Queue = queue.Queue()
+    with _mcp_sessions_lock:
+        _mcp_sessions[session_id] = q
+
+    async def event_stream():
+        try:
+            yield f"event: endpoint\ndata: /mcp/messages?session_id={session_id}\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=300)
+                    if msg is None:
+                        break
+                    yield f"event: message\ndata: {json.dumps(msg)}\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            with _mcp_sessions_lock:
+                _mcp_sessions.pop(session_id, None)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/mcp/messages")
+async def mcp_messages(request: Request):
+    session_id = request.query_params.get("session_id", "")
+    with _mcp_sessions_lock:
+        q = _mcp_sessions.get(session_id)
+    if q is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+
+    body = await request.json()
+    response = _mcp_handle_message(body)
+    if response is not None:
+        q.put(response)
+    return JSONResponse(content={"ok": True})
+
