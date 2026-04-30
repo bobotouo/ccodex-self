@@ -777,6 +777,89 @@ def auth_accounts(request: Request):
     return Response(content=bridge.response_body, status_code=bridge.response_status, headers=passthrough_headers)
 
 
+@app.get("/auth/accounts/export")
+def auth_accounts_export(request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    _sync_legacy_runtime_state(
+        session_id=request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(),
+        remote_addr=_client_ip(request),
+    )
+    bridge = _LegacyBridgeHandler("GET", "/auth/accounts/export", dict(request.headers), b"", _client_ip(request))
+    bridge.do_GET()
+    passthrough_headers: dict[str, str] = {}
+    for key, value in bridge.response_headers:
+        low = key.lower()
+        if low in {"content-length", "connection", "transfer-encoding"}:
+            continue
+        passthrough_headers.setdefault(key, value)
+    return Response(content=bridge.response_body, status_code=bridge.response_status, headers=passthrough_headers)
+
+
+@app.post("/auth/accounts/import")
+async def auth_accounts_import(request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    body = await request.body()
+    _sync_legacy_runtime_state(
+        session_id=request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(),
+        remote_addr=_client_ip(request),
+    )
+    bridge = _LegacyBridgeHandler("POST", "/auth/accounts/import", dict(request.headers), body, _client_ip(request))
+    bridge.do_POST()
+    passthrough_headers: dict[str, str] = {}
+    for key, value in bridge.response_headers:
+        low = key.lower()
+        if low in {"content-length", "connection", "transfer-encoding"}:
+            continue
+        passthrough_headers.setdefault(key, value)
+    return Response(content=bridge.response_body, status_code=bridge.response_status, headers=passthrough_headers)
+
+
+@app.post("/auth/accounts/batch-delete")
+async def auth_accounts_batch_delete(request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    body = await request.body()
+    _sync_legacy_runtime_state(
+        session_id=request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(),
+        remote_addr=_client_ip(request),
+    )
+    bridge = _LegacyBridgeHandler("POST", "/auth/accounts/batch-delete", dict(request.headers), body, _client_ip(request))
+    bridge.do_POST()
+    passthrough_headers: dict[str, str] = {}
+    for key, value in bridge.response_headers:
+        low = key.lower()
+        if low in {"content-length", "connection", "transfer-encoding"}:
+            continue
+        passthrough_headers.setdefault(key, value)
+    return Response(content=bridge.response_body, status_code=bridge.response_status, headers=passthrough_headers)
+
+
+@app.post("/auth/accounts/batch-status")
+async def auth_accounts_batch_status(request: Request):
+    reject = _require_dashboard(request)
+    if reject is not None:
+        return reject
+    body = await request.body()
+    _sync_legacy_runtime_state(
+        session_id=request.cookies.get(DASHBOARD_SESSION_COOKIE, "").strip(),
+        remote_addr=_client_ip(request),
+    )
+    bridge = _LegacyBridgeHandler("POST", "/auth/accounts/batch-status", dict(request.headers), body, _client_ip(request))
+    bridge.do_POST()
+    passthrough_headers: dict[str, str] = {}
+    for key, value in bridge.response_headers:
+        low = key.lower()
+        if low in {"content-length", "connection", "transfer-encoding"}:
+            continue
+        passthrough_headers.setdefault(key, value)
+    return Response(content=bridge.response_body, status_code=bridge.response_status, headers=passthrough_headers)
+
+
 @app.post("/auth/login-start")
 async def auth_login_start(request: Request):
     reject = _require_dashboard(request)

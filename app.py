@@ -41,6 +41,8 @@ from codex2gpt.protocols.relay import (
 )
 from codex2gpt.schema_utils import prepare_json_schema
 from codex2gpt.state_db import RuntimeStateStore
+from codex2gpt.conversation_backend import ConversationBackendClient, IMAGE_MODELS as CONVERSATION_IMAGE_MODELS
+from codex2gpt.image_cache import ImageCache
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -102,6 +104,7 @@ TOKEN_URL = "https://auth.openai.com/oauth/token"
 AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
 UPSTREAM_URL = "https://chatgpt.com/backend-api/codex/responses"
 QUOTA_URL = "https://chatgpt.com/backend-api/codex/usage"
+CONVERSATION_INIT_URL = "https://chatgpt.com/backend-api/conversation/init"
 MODEL_DISCOVERY_URL = os.environ.get("LITE_MODEL_DISCOVERY_URL", "https://chatgpt.com/backend-api/models").strip()
 MODEL_DISCOVERY_ENABLED = os.environ.get("LITE_MODEL_DISCOVERY_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 MODEL_DISCOVERY_TTL_SECONDS = int(os.environ.get("LITE_MODEL_DISCOVERY_TTL_SECONDS", "120") or "120")
@@ -116,6 +119,10 @@ UPSTREAM_HEADERS = {
     "Origin": "https://chatgpt.com",
     "Referer": "https://chatgpt.com/codex",
 }
+IMAGE_GENERATION_ENABLED = os.environ.get("LITE_IMAGE_GENERATION_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+IMAGE_CACHE_DIR = os.path.abspath(os.environ.get("LITE_IMAGE_CACHE_DIR", os.path.join(RUNTIME_DIR, "images")))
+IMAGE_CACHE_TTL_SECONDS = int(os.environ.get("LITE_IMAGE_CACHE_TTL_SECONDS", "86400") or "86400")
+IMAGE_CACHE = ImageCache(IMAGE_CACHE_DIR, IMAGE_CACHE_TTL_SECONDS) if IMAGE_GENERATION_ENABLED else None
 UNSUPPORTED_TOP_LEVEL_FIELDS = {
     "max_output_tokens",
     "max_tokens",
@@ -1507,7 +1514,52 @@ def advertised_model_catalog():
             }
         )
 
+    # Image generation models
+    if IMAGE_GENERATION_ENABLED:
+        for model in CONVERSATION_IMAGE_MODELS:
+            if model in seen:
+                continue
+            seen.add(model)
+            entries.append(
+                {
+                    "id": model,
+                    "object": "model",
+                    "created": 1738368000,
+                    "owned_by": "openai",
+                    "type": "image_generation_model",
+                    "display_name": model,
+                    "supported_plans": [],
+                }
+            )
+
     return entries
+
+
+def is_image_model(model_name: str) -> bool:
+    return str(model_name or "").strip() in CONVERSATION_IMAGE_MODELS
+
+
+def _extract_prompt_from_input(raw_input) -> str:
+    if isinstance(raw_input, str):
+        return raw_input.strip()
+    if isinstance(raw_input, list):
+        parts = []
+        for item in raw_input:
+            if isinstance(item, dict):
+                if item.get("type") == "message":
+                    content = item.get("content", [])
+                    if isinstance(content, list):
+                        for c in content:
+                            if isinstance(c, dict) and c.get("type") == "input_text":
+                                parts.append(c.get("text", ""))
+                    elif isinstance(content, str):
+                        parts.append(content)
+                elif item.get("type") == "input_text":
+                    parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(parts).strip()
+    return ""
 
 
 def auth_file_metadata(auth_file):
@@ -1602,6 +1654,48 @@ def record_account_usage(account_name, response):
         output_tokens=current_usage["output_tokens"],
         request_count=current_usage["request_count"],
         metadata={"response_id": response.get("id"), "model": response.get("model")},
+    )
+
+
+def record_image_usage(account_name):
+    if not account_name:
+        return
+    existing = STATE_DB.get_account(account_name) or {}
+    current_usage = dict(existing.get("usage") or {})
+    current_usage["request_count"] = int(current_usage.get("request_count") or 0) + 1
+    current_usage["image_count"] = int(current_usage.get("image_count") or 0) + 1
+
+    # Decrement image_gen_remaining in quota
+    quota = dict(existing.get("quota") or {})
+    remaining = quota.get("image_gen_remaining")
+    if remaining is not None:
+        try:
+            quota["image_gen_remaining"] = max(0, int(remaining) - 1)
+        except (TypeError, ValueError):
+            pass
+
+    STATE_DB.upsert_account(
+        account_name,
+        auth_file=existing.get("auth_file"),
+        email=existing.get("email"),
+        user_id=existing.get("user_id"),
+        account_id=existing.get("account_id"),
+        plan_type=existing.get("plan_type"),
+        status="active",
+        refresh_token=existing.get("refresh_token"),
+        proxy_id=existing.get("proxy_id"),
+        last_error=None,
+        metadata=existing.get("metadata") or {},
+        quota=quota,
+        usage=current_usage,
+        auth_payload=existing.get("auth_payload") or {},
+    )
+    STATE_DB.append_usage_snapshot(
+        account_name,
+        input_tokens=current_usage.get("input_tokens", 0),
+        output_tokens=current_usage.get("output_tokens", 0),
+        request_count=current_usage["request_count"],
+        metadata={"type": "image_generation"},
     )
 
 
@@ -2026,6 +2120,53 @@ def fetch_account_quota(account):
     return payload
 
 
+def fetch_conversation_init(account):
+    proxy_url = resolve_proxy_url_for_account(account.name)
+
+    def _build_request():
+        headers = build_default_desktop_headers(account.name)
+        headers["Authorization"] = f"Bearer {account.access_token()}"
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        cookie_header = account_cookie_header(account.name)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        return urllib.request.Request(
+            CONVERSATION_INIT_URL,
+            data=json.dumps({}).encode(),
+            headers=order_headers(headers, account_name=account.name),
+            method="POST",
+        )
+
+    request = _build_request()
+    try:
+        payload = load_json_with_transport_fallback(request, proxy_url=proxy_url, timeout=30, account_name=account.name)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            raise
+        account.refresh_access_token()
+        request = _build_request()
+        payload = load_json_with_transport_fallback(request, proxy_url=proxy_url, timeout=30, account_name=account.name)
+
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def extract_image_gen_quota(raw_init):
+    limits_progress = raw_init.get("limits_progress") if isinstance(raw_init.get("limits_progress"), list) else []
+    for entry in limits_progress:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("feature_name") == "image_gen":
+            return {
+                "image_gen_remaining": int(entry.get("remaining") or 0),
+                "image_gen_restore_at": entry.get("reset_after") or "",
+                "image_gen_limit": int(entry.get("limit") or 0),
+            }
+    return {"image_gen_remaining": None, "image_gen_restore_at": "", "image_gen_limit": None}
+
+
 def extract_quota_summary(raw_quota):
     if not isinstance(raw_quota, dict):
         return {}
@@ -2070,6 +2211,7 @@ def extract_quota_summary(raw_quota):
         "reset_at": display_primary.get("reset_at"),
         "reset_after_seconds": display_primary.get("reset_after_seconds"),
         "limit_window_seconds": display_primary.get("limit_window_seconds"),
+        "refreshed_at": now_iso(),
         "secondary_rate_limit": {
             "used_percent": display_secondary.get("used_percent"),
             "reset_at": display_secondary.get("reset_at"),
@@ -2133,6 +2275,17 @@ def update_quota_warning_state(entry_id, quota_summary):
 def refresh_account_quota(account):
     raw_quota = fetch_account_quota(account)
     summary = extract_quota_summary(raw_quota)
+
+    # Fetch image_gen quota from conversation/init
+    image_gen_info = {}
+    try:
+        raw_init = fetch_conversation_init(account)
+        image_gen_info = extract_image_gen_quota(raw_init)
+    except Exception:
+        image_gen_info = {"image_gen_remaining": None, "image_gen_restore_at": "", "image_gen_limit": None}
+
+    summary.update(image_gen_info)
+
     existing = STATE_DB.get_account(account.name) or {}
     auth_payload = read_json_file(account.auth_file, {})
     update_account_record(
@@ -2165,6 +2318,61 @@ def refresh_all_account_quotas():
             update_account_record(account.name, status="error", last_error=str(exc))
             errors.append({"entry_id": account.name, "error": str(exc)})
     return {"results": results, "errors": errors}
+
+
+def _quota_refreshed_at(quota, account=None):
+    quota = quota if isinstance(quota, dict) else {}
+    raw = quota.get("refreshed_at") or quota.get("last_checked_at") or ""
+    if not raw and isinstance(account, dict):
+        raw = account.get("updated_at") or ""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def account_quota_is_stale(account_record, *, refresh_interval_seconds=None):
+    account_record = account_record if isinstance(account_record, dict) else {}
+    quota = account_record.get("quota") if isinstance(account_record.get("quota"), dict) else {}
+    if not quota:
+        return True
+    interval = refresh_interval_seconds
+    if interval is None:
+        quota_settings = RUNTIME_SETTINGS.get("quota") if isinstance(RUNTIME_SETTINGS.get("quota"), dict) else {}
+        interval = int(quota_settings.get("refresh_interval_seconds") or 300)
+    refreshed_at = _quota_refreshed_at(quota, account_record)
+    if refreshed_at is None:
+        return True
+    age = (datetime.datetime.now(datetime.timezone.utc) - refreshed_at).total_seconds()
+    return age >= max(30, int(interval))
+
+
+def refresh_stale_account_quotas():
+    quota_settings = RUNTIME_SETTINGS.get("quota") if isinstance(RUNTIME_SETTINGS.get("quota"), dict) else {}
+    interval = int(quota_settings.get("refresh_interval_seconds") or 300)
+    results = []
+    errors = []
+    skipped = []
+    for account in pool.accounts:
+        record = STATE_DB.get_account(account.name) or {}
+        if not account_quota_is_stale(record, refresh_interval_seconds=interval):
+            skipped.append({"entry_id": account.name, "reason": "fresh"})
+            continue
+        try:
+            results.append({"entry_id": account.name, "quota": refresh_account_quota(account)})
+        except urllib.error.HTTPError as exc:
+            status = "expired" if exc.code == 401 else "banned" if exc.code == 403 else "error"
+            update_account_record(account.name, status=status, last_error=str(exc))
+            errors.append({"entry_id": account.name, "error": str(exc), "status_code": exc.code})
+        except Exception as exc:
+            update_account_record(account.name, status="error", last_error=str(exc))
+            errors.append({"entry_id": account.name, "error": str(exc)})
+    return {"results": results, "errors": errors, "skipped": skipped, "mode": "auto", "refresh_interval_seconds": interval}
 
 
 def diagnose_proxy_connection(proxy_id):
@@ -5297,7 +5505,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             sync_accounts_with_state()
             quota_mode = (query.get("quota") or [""])[0]
-            quota_refresh = refresh_all_account_quotas() if quota_mode == "fresh" else None
+            if quota_mode == "fresh":
+                quota_refresh = refresh_all_account_quotas()
+            elif quota_mode == "auto":
+                quota_refresh = refresh_stale_account_quotas()
+            else:
+                quota_refresh = None
             codex_app = current_codex_app_state()
             reserved_entry_id = codex_app.get("current_entry_id") if codex_app.get("matched") else ""
             accounts = []
@@ -5608,6 +5821,13 @@ class Handler(BaseHTTPRequestHandler):
                 with open(file_path, "rb") as f:
                     self._write_text(200, f.read(), content_type)
                 return
+        if path.startswith("/images/") and IMAGE_GENERATION_ENABLED and IMAGE_CACHE:
+            file_path = IMAGE_CACHE.get_path(path)
+            if file_path:
+                content_type = mimetypes.guess_type(str(file_path))[0] or "image/png"
+                with open(file_path, "rb") as f:
+                    self._write_text(200, f.read(), content_type)
+                return
         self._write_json(404, {"error": {"type": "not_found", "message": "not found"}})
 
     def do_POST(self):
@@ -5756,6 +5976,29 @@ class Handler(BaseHTTPRequestHandler):
             pool.reload()
             sync_accounts_with_state()
             self._write_json(200, {"imported": imported, "count": len(imported)})
+            return
+
+        if path == "/auth/accounts/export":
+            if not self._require_dashboard_access():
+                return
+            exported = []
+            for account in STATE_DB.list_accounts():
+                entry_id = account.get("entry_id", "")
+                auth_file = os.path.join(AUTH_DIR, entry_id)
+                auth_payload = read_json_file(auth_file, {})
+                tokens = auth_tokens_from_payload(auth_payload) if isinstance(auth_payload, dict) else {}
+                exported.append({
+                    "entry_id": entry_id,
+                    "email": account.get("email", ""),
+                    "status": account.get("status", ""),
+                    "plan_type": account.get("plan_type", ""),
+                    "tokens": {
+                        "access_token": tokens.get("access_token", ""),
+                        "refresh_token": tokens.get("refresh_token", ""),
+                        "id_token": tokens.get("id_token", ""),
+                    },
+                })
+            self._write_json(200, {"accounts": exported, "count": len(exported)})
             return
 
         if path == "/auth/codex-app/select":
@@ -6332,6 +6575,88 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
                 return
             requested_model_name = str(raw_payload.get("model") or payload.get("model") or DEFAULT_MODEL)
+
+            # Image model routing
+            if IMAGE_GENERATION_ENABLED and is_image_model(requested_model_name):
+                try:
+                    prompt_text = ""
+                    messages = raw_payload.get("messages")
+                    if isinstance(messages, list):
+                        for msg in reversed(messages):
+                            if isinstance(msg, dict) and str(msg.get("role") or "").lower() == "user":
+                                content = msg.get("content", "")
+                                if isinstance(content, str):
+                                    prompt_text = content.strip()
+                                elif isinstance(content, list):
+                                    for part in content:
+                                        if isinstance(part, dict) and str(part.get("type") or "") == "text":
+                                            prompt_text = str(part.get("text") or "").strip()
+                                            break
+                                break
+                    if not prompt_text:
+                        prompt_text = str(raw_payload.get("prompt") or "").strip()
+                    if not prompt_text:
+                        self._write_json(400, {"error": {"type": "invalid_request_error", "message": "no prompt found for image generation"}})
+                        return
+                    accounts = pool.candidates("", requested_model_name)
+                    if not accounts:
+                        self._write_json(429, {"error": {"type": "rate_limit_error", "message": "no available accounts"}})
+                        return
+                    stream = bool(raw_payload.get("stream"))
+                    last_error = None
+                    for account in accounts:
+                        try:
+                            proxy_url = resolve_proxy_url_for_account(account.name)
+                            client = ConversationBackendClient(
+                                access_token=account.access_token(),
+                                proxy_url=proxy_url,
+                                account_name=account.name,
+                            )
+                            result = client.generate_image_b64(prompt_text, n=1, model=requested_model_name)
+                            pool.mark_success(account.name)
+                            record_image_usage(account.name)
+                            content_text = ""
+                            for item in (result.get("data") or []):
+                                b64 = str(item.get("b64_json") or "")
+                                if b64:
+                                    content_text += f"![image](data:image/png;base64,{b64})\n\n"
+                            if not content_text:
+                                content_text = "Image generation completed."
+                            completion_id = f"chatcmpl-{secrets.token_hex(16)}"
+                            created_ts = int(time.time())
+                            if stream:
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/event-stream")
+                                self.send_header("Cache-Control", "no-cache")
+                                self.send_header("Connection", "close")
+                                self.end_headers()
+                                role_chunk = json.dumps({"id": completion_id, "object": "chat.completion.chunk", "created": created_ts, "model": requested_model_name, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
+                                self.wfile.write(f"data: {role_chunk}\n\n".encode())
+                                content_chunk = json.dumps({"id": completion_id, "object": "chat.completion.chunk", "created": created_ts, "model": requested_model_name, "choices": [{"index": 0, "delta": {"content": content_text}, "finish_reason": None}]})
+                                self.wfile.write(f"data: {content_chunk}\n\n".encode())
+                                done_chunk = json.dumps({"id": completion_id, "object": "chat.completion.chunk", "created": created_ts, "model": requested_model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                                self.wfile.write(f"data: {done_chunk}\n\n".encode())
+                                self.wfile.write(b"data: [DONE]\n\n")
+                                self.wfile.flush()
+                            else:
+                                self._write_json(200, {
+                                    "id": completion_id,
+                                    "object": "chat.completion",
+                                    "created": created_ts,
+                                    "model": requested_model_name,
+                                    "choices": [{"index": 0, "message": {"role": "assistant", "content": content_text}, "finish_reason": "stop"}],
+                                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                                })
+                            return
+                        except Exception as exc:
+                            last_error = exc
+                            pool.mark_failure(account.name, str(exc))
+                            continue
+                    self._write_json(502, {"error": {"type": "upstream_error", "message": str(last_error or "all accounts failed")}})
+                except Exception as exc:
+                    self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
+                return
+
             estimated_tokens, budget_spec, budget_error = validate_context_budget(
                 payload, requested_model=requested_model_name
             )
@@ -6426,6 +6751,57 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
             return
 
+        if path == "/v1/images/generations":
+            if not IMAGE_GENERATION_ENABLED:
+                self._write_json(404, {"error": {"type": "not_found", "message": "image generation is not enabled"}})
+                return
+            if not self._require_api_key():
+                return
+            raw_payload = {}
+            try:
+                raw_payload = self._read_json()
+            except Exception as exc:
+                self._write_json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
+                return
+            prompt = str(raw_payload.get("prompt") or "").strip()
+            if not prompt:
+                self._write_json(400, {"error": {"type": "invalid_request_error", "message": "prompt is required"}})
+                return
+            n = max(1, min(4, int(raw_payload.get("n") or 1)))
+            size = str(raw_payload.get("size") or "") or None
+            response_format = str(raw_payload.get("response_format") or "b64_json")
+            model = str(raw_payload.get("model") or "gpt-image-2")
+            if not is_image_model(model):
+                self._write_json(400, {"error": {"type": "invalid_request_error", "message": f"unsupported image model: {model}, supported: {', '.join(CONVERSATION_IMAGE_MODELS)}"}})
+                return
+            try:
+                accounts = pool.candidates("", model)
+                if not accounts:
+                    self._write_json(429, {"error": {"type": "rate_limit_error", "message": "no available accounts"}})
+                    return
+                last_error = None
+                for account in accounts:
+                    try:
+                        proxy_url = resolve_proxy_url_for_account(account.name)
+                        client = ConversationBackendClient(
+                            access_token=account.access_token(),
+                            proxy_url=proxy_url,
+                            account_name=account.name,
+                        )
+                        result = client.generate_image_b64(prompt, n=n, size=size, model=model)
+                        pool.mark_success(account.name)
+                        record_image_usage(account.name)
+                        self._write_json(200, result)
+                        return
+                    except Exception as exc:
+                        last_error = exc
+                        pool.mark_failure(account.name, str(exc))
+                        continue
+                self._write_json(502, {"error": {"type": "upstream_error", "message": str(last_error or "all accounts failed")}})
+            except Exception as exc:
+                self._write_json(502, {"error": {"type": "upstream_error", "message": str(exc)}})
+            return
+
         if path != "/v1/responses":
             self._write_json(404, {"error": {"type": "not_found", "message": "not found"}})
             return
@@ -6458,6 +6834,71 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         requested_model_name = str(raw_payload.get("model") or payload.get("model") or DEFAULT_MODEL)
+
+        # Image generation routing for /v1/responses
+        if IMAGE_GENERATION_ENABLED and is_image_model(requested_model_name):
+            try:
+                raw_input = raw_payload.get("input", "")
+                if isinstance(raw_input, list):
+                    image_prompt = _extract_prompt_from_input(raw_input)
+                else:
+                    image_prompt = str(raw_input).strip()
+                if not image_prompt:
+                    self._write_json(400, {
+                        "error": {"type": "invalid_request_error", "message": "Missing prompt for image generation."}
+                    })
+                    return
+
+                n = int(raw_payload.get("n", 1) or 1)
+                n = max(1, min(n, 4))
+                size = str(raw_payload.get("size", "1024x1024") or "1024x1024")
+                response_format = str(raw_payload.get("response_format", "b64_json") or "b64_json")
+
+                pool = get_account_pool()
+                last_error = None
+                for account in pool.candidates():
+                    try:
+                        backend = ConversationBackendClient(
+                            access_token=account.get("access_token", ""),
+                            api_key=account.get("api_key", ""),
+                            cookies=account.get("cookies", ""),
+                        )
+                        result = backend.generate_image_b64(
+                            prompt=image_prompt,
+                            model=requested_model_name,
+                            n=n,
+                            size=size,
+                        )
+                        if result.get("error"):
+                            raise RuntimeError(result["error"])
+                        pool.mark_success(account)
+                        output_items = []
+                        for img in result.get("data", []):
+                            item = {
+                                "type": "image_generation_call",
+                                "id": f"imgcmpl_{secrets.token_hex(12)}",
+                                "status": "completed",
+                                "output": img.get("b64_json", ""),
+                            }
+                            output_items.append(item)
+                        self._write_json(200, {
+                            "id": f"resp_{secrets.token_hex(12)}",
+                            "object": "response",
+                            "status": "completed",
+                            "output": output_items,
+                        })
+                        return
+                    except Exception as exc:
+                        last_error = exc
+                        pool.mark_failure(account)
+                        continue
+                error_msg = str(last_error) or "No accounts available for image generation"
+                self._write_json(502, {"error": {"type": "server_error", "message": error_msg}})
+                return
+            except Exception as exc:
+                self._write_json(500, {"error": {"type": "server_error", "message": str(exc)}})
+                return
+
         estimated_tokens, budget_spec, budget_error = validate_context_budget(
             payload, requested_model=requested_model_name
         )
@@ -6884,6 +7325,12 @@ def main():
         int(background.get("token_refresh_seconds") or 300),
         refresh_accounts_if_needed,
     )
+    if IMAGE_GENERATION_ENABLED and IMAGE_CACHE:
+        BACKGROUND_JOBS.start(
+            "image_cache_cleanup",
+            int(background.get("image_cache_cleanup_seconds") or 3600),
+            IMAGE_CACHE.cleanup_expired,
+        )
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     print(f"lite api listening on http://{LISTEN_HOST}:{LISTEN_PORT} with {pool.size()} account(s)", flush=True)
     server.serve_forever()

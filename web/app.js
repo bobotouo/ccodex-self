@@ -4,8 +4,8 @@ const endpoints = {
   rotation: "/admin/rotation-settings",
   usage: "/admin/usage-stats/summary",
   apiKeys: "/admin/api-keys",
-  /** 常规拉取为缓存；首次本会话加载用 quota=fresh 预填一次额度，避免长期「无数据」；后台定时/运维按钮仍会刷新 */
-  accounts: "/auth/accounts",
+  /** 后端按 refresh_interval_seconds 自动刷新缺失/过期额度；手动按钮仍可强制 fresh */
+  accounts: "/auth/accounts?quota=auto",
   proxies: "/api/proxies",
   relays: "/api/relay-providers",
   recentRequests: "/admin/recent-requests?limit=12",
@@ -13,11 +13,17 @@ const endpoints = {
   codeRelay: "/auth/code-relay",
   codexAppSelect: "/auth/codex-app/select",
   connectorSessionCreate: "/admin/connector/session/create",
+  accountDelete: (id) => `/auth/accounts/batch-delete`,
+  accountBatchStatus: "/auth/accounts/batch-status",
+  accountImport: "/auth/accounts/import",
+  accountResetUsage: (id) => `/auth/accounts/${encodeURIComponent(id)}/reset-usage`,
 };
 
 const uiState = {
   view: "overview",
   accountFilter: "all",
+  accountSearch: "",
+  selectedAccounts: new Set(),
   proxyGroup: "__all__",
   usageGranularity: "hourly",
   usageHours: 24,
@@ -31,16 +37,7 @@ const uiState = {
 };
 
 const LANGUAGE_STORAGE_KEY = "codex2gpt.dashboard.language";
-const QUOTA_PREWARM_SESSION_KEY = "c2g_quota_prewarm_done";
-
 function accountsLoadUrl() {
-  try {
-    if (!window.sessionStorage.getItem(QUOTA_PREWARM_SESSION_KEY)) {
-      return `${endpoints.accounts}?quota=fresh`;
-    }
-  } catch {
-    // ignore
-  }
   return endpoints.accounts;
 }
 
@@ -153,6 +150,7 @@ const TRANSLATIONS = {
     "common.window": "窗口",
     "common.reset": "重置",
     "common.remaining": "剩余",
+    "common.expired": "已恢复",
     "common.status": "状态",
     "common.plan": "套餐",
     "common.updated": "更新于",
@@ -190,6 +188,7 @@ const TRANSLATIONS = {
     "api.anthropicMessages": "Anthropic Messages",
     "api.gemini": "Gemini",
     "api.codexResponses": "Codex Responses",
+    "api.imageGeneration": "图像生成",
     "codexApp.noMatchedAccount": "未匹配到本地账号",
     "codexApp.authFile": "认证文件",
     "codexApp.currentAccount": "当前账号",
@@ -226,6 +225,32 @@ const TRANSLATIONS = {
     "accounts.quotaWindow": "额度窗口",
     "accounts.secondaryWindow": "次级窗口",
     "accounts.usedPercent": "已使用 {value}%",
+    "accounts.searchPlaceholder": "搜索账号...",
+    "accounts.refresh": "刷新额度",
+    "accounts.delete": "删除",
+    "accounts.copyId": "复制 ID",
+    "accounts.selectAll": "全选",
+    "accounts.selected": "已选 {count} 个",
+    "accounts.bulkDelete": "批量删除",
+    "accounts.bulkRefresh": "批量刷新",
+    "accounts.bulkEnable": "批量启用",
+    "accounts.bulkDisable": "批量禁用",
+    "accounts.import": "导入账号",
+    "accounts.importHint": "每行一个 token（access_token 或 session_key），或粘贴 JSON 数组",
+    "accounts.importConfirm": "导入",
+    "accounts.importCancel": "取消",
+    "accounts.export": "导出账号",
+    "accounts.confirmDelete": "确定要删除此账号吗？",
+    "accounts.confirmBulkDelete": "确定要删除选中的 {count} 个账号吗？",
+    "accounts.refreshing": "刷新中...",
+    "accounts.deleted": "已删除",
+    "accounts.copied": "已复制",
+    "accounts.imageQuota": "图像额度",
+    "accounts.imageQuotaRemaining": "剩余额度",
+    "accounts.imageQuotaRestore": "恢复时间",
+    "accounts.imageQuotaUnknown": "未知",
+    "accounts.imageQuotaInfinity": "无限制",
+    "accounts.imageCount": "图像数",
     "proxy.summary.proxies": "代理",
     "proxy.summary.active": "活跃",
     "proxy.summary.degraded": "异常",
@@ -378,6 +403,7 @@ const TRANSLATIONS = {
     "common.window": "Window",
     "common.reset": "Reset",
     "common.remaining": "In",
+    "common.expired": "Expired",
     "common.status": "Status",
     "common.plan": "Plan",
     "common.updated": "Updated",
@@ -415,6 +441,7 @@ const TRANSLATIONS = {
     "api.anthropicMessages": "Anthropic Messages",
     "api.gemini": "Gemini",
     "api.codexResponses": "Codex Responses",
+    "api.imageGeneration": "Image Generation",
     "codexApp.noMatchedAccount": "No matched local account",
     "codexApp.authFile": "Auth File",
     "codexApp.currentAccount": "Current Account",
@@ -451,6 +478,32 @@ const TRANSLATIONS = {
     "accounts.quotaWindow": "Quota Window",
     "accounts.secondaryWindow": "Secondary Window",
     "accounts.usedPercent": "{value}% used",
+    "accounts.searchPlaceholder": "Search accounts...",
+    "accounts.refresh": "Refresh Quota",
+    "accounts.delete": "Delete",
+    "accounts.copyId": "Copy ID",
+    "accounts.selectAll": "Select All",
+    "accounts.selected": "{count} selected",
+    "accounts.bulkDelete": "Bulk Delete",
+    "accounts.bulkRefresh": "Bulk Refresh",
+    "accounts.bulkEnable": "Bulk Enable",
+    "accounts.bulkDisable": "Bulk Disable",
+    "accounts.import": "Import Accounts",
+    "accounts.importHint": "One token per line (access_token or session_key), or paste a JSON array",
+    "accounts.importConfirm": "Import",
+    "accounts.importCancel": "Cancel",
+    "accounts.export": "Export Accounts",
+    "accounts.confirmDelete": "Delete this account?",
+    "accounts.confirmBulkDelete": "Delete {count} selected accounts?",
+    "accounts.refreshing": "Refreshing...",
+    "accounts.deleted": "Deleted",
+    "accounts.copied": "Copied",
+    "accounts.imageQuota": "Image Quota",
+    "accounts.imageQuotaRemaining": "Remaining",
+    "accounts.imageQuotaRestore": "Restores At",
+    "accounts.imageQuotaUnknown": "Unknown",
+    "accounts.imageQuotaInfinity": "Unlimited",
+    "accounts.imageCount": "Images",
     "proxy.summary.proxies": "Proxies",
     "proxy.summary.active": "Active",
     "proxy.summary.degraded": "Degraded",
@@ -648,6 +701,17 @@ function formatDurationCompact(value) {
   return `${totalSeconds}${units.second}`;
 }
 
+function formatRestoreTime(restoreAt) {
+  if (!restoreAt) return "";
+  const date = new Date(restoreAt);
+  if (Number.isNaN(date.getTime())) return restoreAt;
+  const now = Date.now();
+  const diffMs = date.getTime() - now;
+  if (diffMs <= 0) return t("common.expired") || "已恢复";
+  const diffSec = Math.round(diffMs / 1000);
+  return formatDurationCompact(diffSec);
+}
+
 function formatTimeOnly(value) {
   if (!value) {
     return "—";
@@ -733,6 +797,9 @@ function quotaSummary(account) {
     limitReached: Boolean(primary?.limit_reached || limit?.limit_reached),
     allowed: quota?.allowed ?? limit?.allowed,
     planType: quota?.plan_type || account?.plan_type || "",
+    imageGenRemaining: quota?.image_gen_remaining ?? null,
+    imageGenRestoreAt: quota?.image_gen_restore_at || "",
+    imageGenLimit: quota?.image_gen_limit ?? null,
   };
 }
 
@@ -944,6 +1011,11 @@ function renderApiConfig() {
       path: `${baseUrl}/v1/responses`,
       snippet: `curl ${baseUrl}/v1/responses`,
     },
+    {
+      label: t("api.imageGeneration"),
+      path: `${baseUrl}/v1/images/generations`,
+      snippet: `curl ${baseUrl}/v1/images/generations`,
+    },
   ];
 
   setHtml(
@@ -1079,20 +1151,83 @@ function renderAccountFilters(accountsPayload) {
     ["disabled", t("accountFilter.disabled")],
   ];
 
-  setHtml(
-    "#account-filters",
-    labels
-      .filter(([key]) => key === "all" || (counts.get(key) || 0) > 0)
-      .map(
-        ([key, label]) => `
-          <button class="chip ${uiState.accountFilter === key ? "is-active" : ""}" data-account-filter="${escapeHtml(key)}">
-            ${escapeHtml(label)}
-            <strong>${escapeHtml(counts.get(key) || 0)}</strong>
-          </button>
-        `,
-      )
-      .join(""),
-  );
+  const selectedCount = uiState.selectedAccounts.size;
+  const container = document.querySelector("#account-filters");
+
+  // Only create the search input once; preserve focus across re-renders
+  if (!container.querySelector("#account-search-input")) {
+    const searchDiv = document.createElement("div");
+    searchDiv.className = "account-search";
+    searchDiv.innerHTML = `<input id="account-search-input" type="text" placeholder="${escapeHtml(t("accounts.searchPlaceholder"))}" value="${escapeHtml(uiState.accountSearch)}"`;
+    container.prepend(searchDiv);
+    searchDiv.querySelector("#account-search-input").addEventListener("input", (e) => {
+      uiState.accountSearch = e.target.value;
+      renderAccounts(accountsPayload);
+    });
+  }
+
+  // Update filter chips and bulk bar — these can be rebuilt freely
+  let chipsHtml = labels
+    .filter(([key]) => key === "all" || (counts.get(key) || 0) > 0)
+    .map(
+      ([key, label]) => `
+      <button class="chip ${uiState.accountFilter === key ? "is-active" : ""}" data-account-filter="${escapeHtml(key)}">
+        ${escapeHtml(label)}
+        <strong>${escapeHtml(counts.get(key) || 0)}</strong>
+      </button>
+    `,
+    )
+    .join("");
+
+  let bulkHtml = `
+    <div class="bulk-bar ${selectedCount === 0 ? "hidden" : ""}">
+      <label class="section-heading-row" style="margin:0">
+        <input type="checkbox" class="account-select" id="account-select-all" ${selectedCount === accounts.length ? "checked" : ""} />
+        <span class="bulk-count">${escapeHtml(t("accounts.selected", { count: selectedCount }))}</span>
+      </label>
+      <div class="bulk-actions">
+        <button class="action-btn" data-bulk-action="refresh">${escapeHtml(t("accounts.bulkRefresh"))}</button>
+        <button class="action-btn" data-bulk-action="enable">${escapeHtml(t("accounts.bulkEnable"))}</button>
+        <button class="action-btn" data-bulk-action="disable">${escapeHtml(t("accounts.bulkDisable"))}</button>
+        <button class="action-btn danger" data-bulk-action="delete">${escapeHtml(t("accounts.bulkDelete"))}</button>
+      </div>
+    </div>
+  `;
+
+  // Remove old chips and bulk bar, then re-insert after search input
+  container.querySelectorAll(".badge-row, .bulk-bar").forEach((el) => el.remove());
+  container.insertAdjacentHTML("beforeend", `<div class="badge-row">${chipsHtml}</div>${bulkHtml}`);
+
+  const selectAllCheckbox = container.querySelector("#account-select-all");
+  if (selectAllCheckbox) {
+    selectAllCheckbox.addEventListener("change", () => {
+      const filtered = filterAccountList(accounts, uiState.accountFilter, uiState.accountSearch);
+      if (selectAllCheckbox.checked) {
+        filtered.forEach((a) => uiState.selectedAccounts.add(a.entry_id));
+      } else {
+        filtered.forEach((a) => uiState.selectedAccounts.delete(a.entry_id));
+      }
+      renderAccounts(accountsPayload);
+    });
+  }
+}
+
+function filterAccountList(accounts, filter, search) {
+  let list = accounts;
+  if (filter !== "all") {
+    list = list.filter((a) => (a.status || "unknown") === filter);
+  }
+  if (search) {
+    const q = search.toLowerCase();
+    list = list.filter(
+      (a) =>
+        (a.email || "").toLowerCase().includes(q) ||
+        (a.entry_id || "").toLowerCase().includes(q) ||
+        (a.status || "").toLowerCase().includes(q) ||
+        (a.plan_type || "").toLowerCase().includes(q),
+    );
+  }
+  return list;
 }
 
 function renderAccounts(accountsPayload) {
@@ -1128,12 +1263,16 @@ function renderAccounts(accountsPayload) {
             : quota.usedPercent && quota.usedPercent > 0
               ? t("accounts.proxyTrafficChanged")
               : t("accounts.noUsageYet");
+        const isSelected = uiState.selectedAccounts.has(account.entry_id);
         return `
           <article class="account-card">
             <div class="account-card-header">
-              <div>
-                <strong>${escapeHtml(account.email || account.entry_id)}</strong>
-                <small>${escapeHtml(account.entry_id)}</small>
+              <div style="display:flex; align-items:flex-start; gap:8px; min-width:0; flex:1">
+                <input type="checkbox" class="account-select" data-account-select="${escapeHtml(account.entry_id)}" ${isSelected ? "checked" : ""} style="margin-top:3px; flex-shrink:0" />
+                <div style="min-width:0">
+                  <strong>${escapeHtml(account.email || account.entry_id)}</strong>
+                  <small>${escapeHtml(account.entry_id)}</small>
+                </div>
               </div>
               ${renderBadge(account.status || "unknown", account.plan_type || "free", statusTone(account.status))}
             </div>
@@ -1152,10 +1291,28 @@ function renderAccounts(accountsPayload) {
                 <strong>${escapeHtml(quota.planType || account.plan_type || "—")}</strong>
               </div>
               <div class="metric">
+                <span>${escapeHtml(t("accounts.imageQuota"))}</span>
+                <strong>${
+                  quota.imageGenRemaining != null
+                    ? `${escapeHtml(String(quota.imageGenRemaining))}${quota.imageGenLimit ? " / " + escapeHtml(String(quota.imageGenLimit)) : ""}`
+                    : escapeHtml(t("accounts.imageQuotaUnknown"))
+                }</strong>
+              </div>
+              <div class="metric">
+                <span>${escapeHtml(t("accounts.imageCount"))}</span>
+                <strong>${escapeHtml(String(account.usage?.image_count || 0))}</strong>
+              </div>
+              <div class="metric">
                 <span>${escapeHtml(t("accounts.proxyTraffic"))}</span>
                 <strong>${escapeHtml(proxyTrafficText)}</strong>
               </div>
             </div>
+
+            ${
+              quota.imageGenRemaining != null && quota.imageGenRestoreAt
+                ? `<div class="muted" style="font-size:0.78rem; margin-top:-4px">${escapeHtml(t("accounts.imageQuotaRestore"))}: ${escapeHtml(formatRestoreTime(quota.imageGenRestoreAt))}</div>`
+                : ""
+            }
 
             <div class="meter">
               <div class="meter-head">
@@ -1184,6 +1341,18 @@ function renderAccounts(accountsPayload) {
               </div>
             `
             }
+
+            <div class="account-actions">
+              <button class="action-btn" data-account-action="refresh" data-account-id="${escapeHtml(account.entry_id)}" title="${escapeHtml(t("accounts.refresh"))}">
+                ↻ ${escapeHtml(t("accounts.refresh"))}
+              </button>
+              <button class="action-btn" data-account-action="copy-id" data-account-id="${escapeHtml(account.entry_id)}" title="${escapeHtml(t("accounts.copyId"))}">
+                ⊘ ${escapeHtml(t("accounts.copyId"))}
+              </button>
+              <button class="action-btn danger" data-account-action="delete" data-account-id="${escapeHtml(account.entry_id)}" title="${escapeHtml(t("accounts.delete"))}">
+                ✕ ${escapeHtml(t("accounts.delete"))}
+              </button>
+            </div>
           </article>
         `;
       })
@@ -1521,13 +1690,6 @@ async function loadDashboardData() {
     loadJson(keyHistoryUrl),
     loadJson(endpoints.recentRequests),
   ]);
-  if (accUrl.includes("quota=fresh")) {
-    try {
-      window.sessionStorage.setItem(QUOTA_PREWARM_SESSION_KEY, "1");
-    } catch {
-      // ignore
-    }
-  }
   uiState.lastRefreshAt = new Date().toISOString();
   uiState.data = { status, runtime, rotation, usage, apiKeys, accounts, proxies, relays, usageHistory, recentRequests };
   return uiState.data;
@@ -1771,6 +1933,29 @@ async function selectCodexAppAccount(entryId) {
   await render();
 }
 
+async function deleteAccounts(ids) {
+  return postJson(endpoints.accountDelete(), { ids });
+}
+
+async function setAccountBatchStatus(ids, status) {
+  return postJson(endpoints.accountBatchStatus, { ids, status });
+}
+
+async function importAccounts(accounts) {
+  return postJson(endpoints.accountImport, { accounts });
+}
+
+async function refreshAccountQuota(entryId) {
+  return postJson(endpoints.accountResetUsage(entryId), {});
+}
+
+async function copyToClipboard(text) {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    return navigator.clipboard.writeText(text);
+  }
+  return Promise.reject(new Error("Clipboard unavailable"));
+}
+
 async function refreshUsage() {
   if (!uiState.data) {
     await render();
@@ -1784,6 +1969,66 @@ async function refreshUsage() {
   uiState.data.apiKeys = await loadJson(apiKeysUrl);
   uiState.data.usageHistory = await loadJson(keyHistoryUrl);
   renderDashboard();
+}
+
+function showImportModal() {
+  const existing = document.querySelector(".modal-backdrop");
+  if (existing) existing.remove();
+
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <div class="modal-card">
+      <h3>${escapeHtml(t("accounts.import"))}</h3>
+      <p class="subcopy small">${escapeHtml(t("accounts.importHint"))}</p>
+      <textarea id="import-textarea" placeholder="eyJhbGciOi...&#10;eyJhbGciOi..."></textarea>
+      <div style="display:flex; gap:8px; justify-content:flex-end">
+        <button class="action secondary" id="import-cancel">${escapeHtml(t("accounts.importCancel"))}</button>
+        <button class="action" id="import-confirm">${escapeHtml(t("accounts.importConfirm"))}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+
+  backdrop.querySelector("#import-cancel")?.addEventListener("click", () => backdrop.remove());
+  backdrop.addEventListener("click", (e) => {
+    if (e.target === backdrop) backdrop.remove();
+  });
+  backdrop.querySelector("#import-confirm")?.addEventListener("click", async () => {
+    const textarea = backdrop.querySelector("#import-textarea");
+    const raw = (textarea?.value || "").trim();
+    if (!raw) return;
+    let accounts = [];
+    try {
+      const parsed = JSON.parse(raw);
+      accounts = Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
+      accounts = lines.map((line) => ({ tokens: [line] }));
+    }
+    if (!accounts.length) return;
+    const result = await importAccounts(accounts);
+    backdrop.remove();
+    if (result?.error) {
+      setText("#accounts-list", renderEmpty(result.error.message || t("common.unknown")));
+    } else {
+      await render();
+    }
+  });
+}
+
+async function exportAccounts() {
+  const result = await loadJson("/auth/accounts/export");
+  if (result?.error) return;
+  const accounts = result?.accounts || [];
+  if (!accounts.length) return;
+  const blob = new Blob([JSON.stringify(accounts, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `codex2gpt-accounts-${new Date().toISOString().slice(0, 10)}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function wireEvents() {
@@ -1953,6 +2198,93 @@ function wireEvents() {
       refreshUsage().catch((error) => {
         setHtml("#usage-chart", `<div class="chart-empty">${escapeHtml(String(error))}</div>`);
       });
+      return;
+    }
+
+    const accountAction = target.closest("[data-account-action]");
+    if (accountAction) {
+      const action = accountAction.getAttribute("data-account-action") || "";
+      const accountId = accountAction.getAttribute("data-account-id") || "";
+      if (action === "delete" && accountId) {
+        if (!window.confirm(t("accounts.confirmDelete"))) return;
+        deleteAccounts([accountId])
+          .then(() => render())
+          .catch(() => {});
+      } else if (action === "refresh" && accountId) {
+        accountAction.disabled = true;
+        accountAction.textContent = t("accounts.refreshing");
+        refreshAccountQuota(accountId)
+          .then(() => render())
+          .catch(() => render());
+      } else if (action === "copy-id" && accountId) {
+        copyToClipboard(accountId)
+          .then(() => {
+            accountAction.textContent = `✓ ${t("accounts.copied")}`;
+            window.setTimeout(() => {
+              accountAction.textContent = `⊘ ${t("accounts.copyId")}`;
+            }, 1200);
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+
+    const accountSelect = target.closest("[data-account-select]");
+    if (accountSelect) {
+      const entryId = accountSelect.getAttribute("data-account-select") || "";
+      if (accountSelect.checked) {
+        uiState.selectedAccounts.add(entryId);
+      } else {
+        uiState.selectedAccounts.delete(entryId);
+      }
+      if (uiState.data?.accounts) {
+        renderAccountFilters(uiState.data.accounts);
+      }
+      return;
+    }
+
+    const bulkAction = target.closest("[data-bulk-action]");
+    if (bulkAction) {
+      const action = bulkAction.getAttribute("data-bulk-action") || "";
+      const ids = [...uiState.selectedAccounts];
+      if (!ids.length) return;
+      if (action === "delete") {
+        if (!window.confirm(t("accounts.confirmBulkDelete", { count: ids.length }))) return;
+        deleteAccounts(ids)
+          .then(() => {
+            uiState.selectedAccounts.clear();
+            render();
+          })
+          .catch(() => {});
+      } else if (action === "refresh") {
+        setAccountBatchStatus(ids, "active")
+          .then(() => render())
+          .catch(() => {});
+      } else if (action === "enable") {
+        setAccountBatchStatus(ids, "active")
+          .then(() => render())
+          .catch(() => {});
+      } else if (action === "disable") {
+        setAccountBatchStatus(ids, "disabled")
+          .then(() => {
+            uiState.selectedAccounts.clear();
+            render();
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+
+    const importButton = target.closest("[data-account-import]");
+    if (importButton) {
+      showImportModal();
+      return;
+    }
+
+    const exportButton = target.closest("[data-account-export]");
+    if (exportButton) {
+      exportAccounts();
+      return;
     }
   });
 
