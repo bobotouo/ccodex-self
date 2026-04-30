@@ -185,10 +185,10 @@ const TRANSLATIONS = {
     "status.disabled": "已禁用",
     "status.noneRegistered": "未注册",
     "api.openaiChat": "OpenAI Chat",
+    "api.openaiChatHint": "支持图像生成：将 model 设为 gpt-image-2 即可生图，无需切换接口",
     "api.anthropicMessages": "Anthropic Messages",
     "api.gemini": "Gemini",
     "api.codexResponses": "Codex Responses",
-    "api.imageGeneration": "图像生成",
     "codexApp.noMatchedAccount": "未匹配到本地账号",
     "codexApp.authFile": "认证文件",
     "codexApp.currentAccount": "当前账号",
@@ -438,10 +438,10 @@ const TRANSLATIONS = {
     "status.disabled": "disabled",
     "status.noneRegistered": "none registered",
     "api.openaiChat": "OpenAI Chat",
+    "api.openaiChatHint": "Supports image generation: set model to gpt-image-2 to generate images, no endpoint switch needed",
     "api.anthropicMessages": "Anthropic Messages",
     "api.gemini": "Gemini",
     "api.codexResponses": "Codex Responses",
-    "api.imageGeneration": "Image Generation",
     "codexApp.noMatchedAccount": "No matched local account",
     "codexApp.authFile": "Auth File",
     "codexApp.currentAccount": "Current Account",
@@ -995,6 +995,7 @@ function renderApiConfig() {
       label: t("api.openaiChat"),
       path: `${baseUrl}/v1/chat/completions`,
       snippet: `curl ${baseUrl}/v1/chat/completions`,
+      hint: t("api.openaiChatHint"),
     },
     {
       label: t("api.anthropicMessages"),
@@ -1011,11 +1012,6 @@ function renderApiConfig() {
       path: `${baseUrl}/v1/responses`,
       snippet: `curl ${baseUrl}/v1/responses`,
     },
-    {
-      label: t("api.imageGeneration"),
-      path: `${baseUrl}/v1/images/generations`,
-      snippet: `curl ${baseUrl}/v1/images/generations`,
-    },
   ];
 
   setHtml(
@@ -1030,6 +1026,7 @@ function renderApiConfig() {
             </div>
             <code>${escapeHtml(item.path)}</code>
             <code>${escapeHtml(item.snippet)}</code>
+            ${item.hint ? `<div class="endpoint-hint">${escapeHtml(item.hint)}</div>` : ""}
           </article>
         `,
       )

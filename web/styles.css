@@ -680,6 +680,14 @@ h2 { font-size: 1.15rem; line-height: 1.2; }
 
 /* ===== Endpoint Items ===== */
 .endpoint-item { display: grid; gap: 8px; }
+.endpoint-hint {
+  font-size: 0.78rem;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 6px 10px;
+  border-radius: 6px;
+  line-height: 1.4;
+}
 .endpoint-list .endpoint-item + .endpoint-item {
   padding-top: 10px;
   border-top: 1px solid var(--border);
