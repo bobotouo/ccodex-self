@@ -1158,7 +1158,7 @@ function renderAccountFilters(accountsPayload) {
   if (!container.querySelector("#account-search-input")) {
     const searchDiv = document.createElement("div");
     searchDiv.className = "account-search";
-    searchDiv.innerHTML = `<input id="account-search-input" type="text" placeholder="${escapeHtml(t("accounts.searchPlaceholder"))}" value="${escapeHtml(uiState.accountSearch)}"`;
+    searchDiv.innerHTML = `<input id="account-search-input" type="text" placeholder="${escapeHtml(t("accounts.searchPlaceholder"))}" value="${escapeHtml(uiState.accountSearch)}" />`;
     container.prepend(searchDiv);
     searchDiv.querySelector("#account-search-input").addEventListener("input", (e) => {
       uiState.accountSearch = e.target.value;
