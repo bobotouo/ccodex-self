@@ -1539,6 +1539,18 @@ def is_image_model(model_name: str) -> bool:
     return str(model_name or "").strip() in CONVERSATION_IMAGE_MODELS
 
 
+def is_image_chat_request(raw_payload: dict) -> bool:
+    """Check if a chat/responses request is for image generation."""
+    model = str(raw_payload.get("model") or "").strip()
+    if model in CONVERSATION_IMAGE_MODELS:
+        return True
+    modalities = raw_payload.get("modalities")
+    if isinstance(modalities, list):
+        if "image" in {str(m or "").strip().lower() for m in modalities}:
+            return True
+    return False
+
+
 def _extract_prompt_from_input(raw_input) -> str:
     if isinstance(raw_input, str):
         return raw_input.strip()
@@ -6577,7 +6589,9 @@ class Handler(BaseHTTPRequestHandler):
             requested_model_name = str(raw_payload.get("model") or payload.get("model") or DEFAULT_MODEL)
 
             # Image model routing
-            if IMAGE_GENERATION_ENABLED and is_image_model(requested_model_name):
+            if IMAGE_GENERATION_ENABLED and is_image_chat_request(raw_payload):
+                if not is_image_model(requested_model_name):
+                    requested_model_name = "gpt-image-2"
                 try:
                     prompt_text = ""
                     messages = raw_payload.get("messages")
@@ -6836,7 +6850,9 @@ class Handler(BaseHTTPRequestHandler):
         requested_model_name = str(raw_payload.get("model") or payload.get("model") or DEFAULT_MODEL)
 
         # Image generation routing for /v1/responses
-        if IMAGE_GENERATION_ENABLED and is_image_model(requested_model_name):
+        if IMAGE_GENERATION_ENABLED and is_image_chat_request(raw_payload):
+            if not is_image_model(requested_model_name):
+                requested_model_name = "gpt-image-2"
             try:
                 raw_input = raw_payload.get("input", "")
                 if isinstance(raw_input, list):
@@ -6854,7 +6870,6 @@ class Handler(BaseHTTPRequestHandler):
                 size = str(raw_payload.get("size", "1024x1024") or "1024x1024")
                 response_format = str(raw_payload.get("response_format", "b64_json") or "b64_json")
 
-                pool = get_account_pool()
                 last_error = None
                 for account in pool.candidates():
                     try:
