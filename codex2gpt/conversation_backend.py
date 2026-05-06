@@ -165,6 +165,9 @@ class ConversationBackendClient:
         if data is not None:
             req.data = data
 
+        auth_val = headers.get("Authorization", "")
+        print(f"[img-debug] HTTP {method} {url} auth={auth_val[:40]}...", flush=True)
+
         if self.proxy_url:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
@@ -180,7 +183,16 @@ class ConversationBackendClient:
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json"
         data = json.dumps(body).encode() if body is not None else None
-        response = self._do_request(url, headers, data=data, method=method, timeout=timeout)
+        try:
+            response = self._do_request(url, headers, data=data, method=method, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            resp_body = ""
+            try:
+                resp_body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            print(f"[img-debug] JSON request HTTPError: {method} {path} status={e.code} body={resp_body}", flush=True)
+            raise
         status = getattr(response, "status", 200)
         body_bytes = response.read()
         response.close()
@@ -195,13 +207,22 @@ class ConversationBackendClient:
         req = urllib.request.Request(url)
         for key, value in self._bootstrap_headers().items():
             req.add_header(key, value)
-        if self.proxy_url:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
-            )
-            response = opener.open(req, timeout=30)
-        else:
-            response = urllib.request.urlopen(req, timeout=30)
+        try:
+            if self.proxy_url:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
+                )
+                response = opener.open(req, timeout=30)
+            else:
+                response = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            print(f"[img-debug] bootstrap HTTPError: status={e.code} url={url} body={body}", flush=True)
+            raise
         status = getattr(response, "status", 200)
         html = response.read().decode("utf-8", errors="replace")
         response.close()
@@ -533,12 +554,23 @@ class ConversationBackendClient:
         enhanced_prompt = _build_image_prompt(prompt, size)
 
         for index in range(n):
+            print(f"[img-debug] step 1/4: bootstrap start token={self.access_token[:20]}...", flush=True)
             self._bootstrap()
+            print(f"[img-debug] step 1/4: bootstrap OK", flush=True)
+
+            print(f"[img-debug] step 2/4: chat-requirements start", flush=True)
             requirements = self._get_chat_requirements()
+            print(f"[img-debug] step 2/4: chat-requirements OK token_len={len(requirements.token)}", flush=True)
+
+            print(f"[img-debug] step 3/4: prepare start model={model}", flush=True)
             conduit_token = self._prepare_image_conversation(enhanced_prompt, requirements, model)
+            print(f"[img-debug] step 3/4: prepare OK conduit_len={len(conduit_token)}", flush=True)
+
+            print(f"[img-debug] step 4/4: start_generation start", flush=True)
             status, sse_payloads = self._start_image_generation(
                 enhanced_prompt, requirements, conduit_token, model
             )
+            print(f"[img-debug] step 4/4: start_generation OK status={status}", flush=True)
 
             conversation_id = ""
             file_ids: list[str] = []

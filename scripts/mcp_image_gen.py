@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """MCP stdio server for image generation via codex2gpt proxy.
 
-Usage in .opencode.json:
+Usage in opencode.jsonc:
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "image-gen": {
-      "type": "stdio",
-      "command": "python3",
-      "args": ["/path/to/scripts/mcp_image_gen.py"],
-      "env": {
+      "type": "local",
+      "command": ["python3", "/path/to/scripts/mcp_image_gen.py"],
+      "enabled": true,
+      "environment": {
         "IMAGE_GEN_URL": "http://localhost:8080",
         "IMAGE_GEN_API_KEY": "your-api-key",
         "IMAGE_SAVE_DIR": "/tmp/generated_images"
@@ -23,8 +24,8 @@ import json
 import os
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 PROXY_URL = os.environ.get("IMAGE_GEN_URL", "http://localhost:8080")
 API_KEY = os.environ.get("IMAGE_GEN_API_KEY", "")
@@ -85,13 +86,17 @@ def save_image(b64_data, filename=None):
     return filepath
 
 
-def call_proxy(prompt, n=1, size="1024x1024"):
-    url = f"{PROXY_URL.rstrip('/')}/v1/images/generations"
+def call_proxy(prompt, n=1, size="1024x1024", model="gpt-image-2"):
+    base = PROXY_URL.rstrip("/")
+    if base.endswith("/v1"):
+        url = f"{base}/images/generations"
+    else:
+        url = f"{base}/v1/images/generations"
     payload = json.dumps({
+        "model": model,
         "prompt": prompt,
         "n": n,
         "size": size,
-        "model": "gpt-image-2",
         "response_format": "b64_json",
     }).encode("utf-8")
 
@@ -100,7 +105,7 @@ def call_proxy(prompt, n=1, size="1024x1024"):
         headers["Authorization"] = f"Bearer {API_KEY}"
 
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=180) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -119,6 +124,17 @@ def handle_generate_image(request_id, arguments):
 
     try:
         result = call_proxy(prompt, n=n, size=size)
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32000, "message": f"HTTP Error {exc.code}: {exc.reason}. {body}".strip()},
+        }
     except Exception as exc:
         return {
             "jsonrpc": "2.0",
@@ -126,9 +142,12 @@ def handle_generate_image(request_id, arguments):
             "error": {"code": -32000, "message": f"Proxy error: {exc}"},
         }
 
+    # Parse b64_json from /v1/images/generations response
+    data_list = result.get("data") or []
+
     saved = []
-    for idx, item in enumerate(result.get("data") or []):
-        b64 = str(item.get("b64_json") or "")
+    for idx, item in enumerate(data_list):
+        b64 = item.get("b64_json") or ""
         if not b64:
             continue
         if n > 1 and filename:

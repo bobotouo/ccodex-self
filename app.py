@@ -885,12 +885,33 @@ class OAuthAccount:
     def _save(self, data):
         write_codex_auth_file(self.auth_file, data)
 
+    @staticmethod
+    def _jwt_is_expired(token: str, buffer_seconds: int = 300) -> bool:
+        """Return True if the JWT is expired or will expire within buffer_seconds."""
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                return True
+            pad = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(pad.encode("ascii")).decode("utf-8"))
+            exp = int(payload.get("exp") or 0)
+            return exp == 0 or time.time() > exp - buffer_seconds
+        except Exception:
+            return False
+
     def access_token(self):
         data = self._load()
         token = data.get("tokens", {}).get("access_token", "").strip()
-        if token:
+        if not token:
+            return self.refresh_access_token()
+        if not self._jwt_is_expired(token):
             return token
-        return self.refresh_access_token()
+        # JWT expired — try to refresh; if refresh fails, fall back to stale token
+        # so the upstream can give us a definitive 401 rather than failing here silently.
+        try:
+            return self.refresh_access_token()
+        except Exception:
+            return token
 
     def refresh_access_token(self):
         with self.lock:
@@ -5840,6 +5861,28 @@ class Handler(BaseHTTPRequestHandler):
                 with open(file_path, "rb") as f:
                     self._write_text(200, f.read(), content_type)
                 return
+        if path == "/auth/accounts/export":
+            if not self._require_dashboard_access():
+                return
+            exported = []
+            for account in STATE_DB.list_accounts():
+                entry_id = account.get("entry_id", "")
+                auth_file = os.path.join(AUTH_DIR, entry_id)
+                auth_payload = read_json_file(auth_file, {})
+                tokens = auth_tokens_from_payload(auth_payload) if isinstance(auth_payload, dict) else {}
+                exported.append({
+                    "entry_id": entry_id,
+                    "email": account.get("email", ""),
+                    "status": account.get("status", ""),
+                    "plan_type": account.get("plan_type", ""),
+                    "tokens": {
+                        "access_token": tokens.get("access_token", ""),
+                        "refresh_token": tokens.get("refresh_token", ""),
+                        "id_token": tokens.get("id_token", ""),
+                    },
+                })
+            self._write_json(200, {"accounts": exported, "count": len(exported)})
+            return
         self._write_json(404, {"error": {"type": "not_found", "message": "not found"}})
 
     def do_POST(self):
@@ -6621,12 +6664,29 @@ class Handler(BaseHTTPRequestHandler):
                     for account in accounts:
                         try:
                             proxy_url = resolve_proxy_url_for_account(account.name)
+                            token = account.access_token()
                             client = ConversationBackendClient(
-                                access_token=account.access_token(),
+                                access_token=token,
                                 proxy_url=proxy_url,
                                 account_name=account.name,
                             )
-                            result = client.generate_image_b64(prompt_text, n=1, model=requested_model_name)
+                            print(f"[image-gen] account={account.name} prompt={prompt_text[:80]}...", flush=True)
+                            try:
+                                result = client.generate_image_b64(prompt_text, n=1, model=requested_model_name)
+                            except urllib.error.HTTPError as http_exc:
+                                if http_exc.code in {401, 403}:
+                                    try:
+                                        new_token = account.refresh_access_token()
+                                        client2 = ConversationBackendClient(
+                                            access_token=new_token,
+                                            proxy_url=proxy_url,
+                                            account_name=account.name,
+                                        )
+                                        result = client2.generate_image_b64(prompt_text, n=1, model=requested_model_name)
+                                    except Exception:
+                                        raise http_exc
+                                else:
+                                    raise
                             pool.mark_success(account.name)
                             record_image_usage(account.name)
                             content_text = ""
@@ -6675,7 +6735,15 @@ class Handler(BaseHTTPRequestHandler):
                             return
                         except Exception as exc:
                             last_error = exc
-                            pool.mark_failure(account.name, str(exc))
+                            print(f"[image-gen] FAILED account={account.name} error={exc}", flush=True)
+                            if isinstance(exc, urllib.error.HTTPError):
+                                if exc.code == 401:
+                                    set_account_status(account.name, "expired", last_error=str(exc))
+                                elif exc.code == 403:
+                                    set_account_status(account.name, "banned", last_error=str(exc))
+                                elif exc.code == 429:
+                                    set_account_status(account.name, "rate_limited", last_error=str(exc))
+                            pool.mark_failure(account.name, exc)
                             continue
                     self._write_json(502, {"error": {"type": "upstream_error", "message": str(last_error or "all accounts failed")}})
                     self._record_failed_transcript(
@@ -6816,12 +6884,31 @@ class Handler(BaseHTTPRequestHandler):
                 for account in accounts:
                     try:
                         proxy_url = resolve_proxy_url_for_account(account.name)
+                        token = account.access_token()
                         client = ConversationBackendClient(
-                            access_token=account.access_token(),
+                            access_token=token,
                             proxy_url=proxy_url,
                             account_name=account.name,
                         )
-                        result = client.generate_image_b64(prompt, n=n, size=size, model=model)
+                        try:
+                            result = client.generate_image_b64(prompt, n=n, size=size, model=model)
+                        except urllib.error.HTTPError as http_exc:
+                            if http_exc.code in {401, 403}:
+                                # Token rejected by upstream — refresh and retry once.
+                                # On any failure, re-raise the original HTTPError so the outer
+                                # handler can apply the correct cooldown and status.
+                                try:
+                                    new_token = account.refresh_access_token()
+                                    client2 = ConversationBackendClient(
+                                        access_token=new_token,
+                                        proxy_url=proxy_url,
+                                        account_name=account.name,
+                                    )
+                                    result = client2.generate_image_b64(prompt, n=n, size=size, model=model)
+                                except Exception:
+                                    raise http_exc
+                            else:
+                                raise
                         pool.mark_success(account.name)
                         record_image_usage(account.name)
                         self._write_json(200, result)
@@ -6832,7 +6919,14 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     except Exception as exc:
                         last_error = exc
-                        pool.mark_failure(account.name, str(exc))
+                        if isinstance(exc, urllib.error.HTTPError):
+                            if exc.code == 401:
+                                set_account_status(account.name, "expired", last_error=str(exc))
+                            elif exc.code == 403:
+                                set_account_status(account.name, "banned", last_error=str(exc))
+                            elif exc.code == 429:
+                                set_account_status(account.name, "rate_limited", last_error=str(exc))
+                        pool.mark_failure(account.name, exc)
                         continue
                 self._write_json(502, {"error": {"type": "upstream_error", "message": str(last_error or "all accounts failed")}})
                 self._record_failed_transcript(
