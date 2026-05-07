@@ -23,6 +23,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -30,6 +31,8 @@ import urllib.request
 PROXY_URL = os.environ.get("IMAGE_GEN_URL", "http://localhost:8080")
 API_KEY = os.environ.get("IMAGE_GEN_API_KEY", "")
 SAVE_DIR = os.environ.get("IMAGE_SAVE_DIR", os.path.expanduser("~/generated_images"))
+# 整次 HTTP 等待上限（秒）。复杂竖版 + 长文案常需数分钟；须 ≤ opencode 的 MCP 超时
+HTTP_TIMEOUT_SEC = max(60, int(os.environ.get("IMAGE_GEN_HTTP_TIMEOUT_SEC", "900")))
 
 TOOL_DEF = {
     "name": "generate_image",
@@ -105,8 +108,30 @@ def call_proxy(prompt, n=1, size="1024x1024", model="gpt-image-2"):
         headers["Authorization"] = f"Bearer {API_KEY}"
 
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    result = {}
+
+    def _do():
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SEC) as resp:
+                result["ok"] = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            result["err"] = e
+
+    log(
+        f"已向代理请求生图（HTTP 最长等待 {HTTP_TIMEOUT_SEC}s）。"
+        "复杂竖版海报可能要几分钟——此期间 MCP 会阻塞直到完成。"
+    )
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    start = time.time()
+    while t.is_alive():
+        t.join(timeout=30)
+        if t.is_alive():
+            elapsed = int(time.time() - start)
+            log(f"仍在等待代理返回… {elapsed}s / http_timeout={HTTP_TIMEOUT_SEC}s")
+    if "err" in result:
+        raise result["err"]
+    return result["ok"]
 
 
 def handle_generate_image(request_id, arguments):

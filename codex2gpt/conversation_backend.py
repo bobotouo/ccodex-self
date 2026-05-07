@@ -4,15 +4,36 @@ Ported from chatgpt2api's OpenAIBackendAPI, adapted for codex2gpt's
 account pool and HTTP request patterns.
 """
 
+
+class ImageGenerationStartedError(RuntimeError):
+    """Raised when image generation was successfully started (tool_invoked=True)
+    but we timed out waiting for the result to appear in the conversation.
+    Unlike a quota error, retrying with a different account would waste that
+    account's daily quota too — the original image may still finish later.
+    """
+
+
+class ImageQuotaExhaustedError(RuntimeError):
+    """Raised when ChatGPT explicitly reports the account's image generation
+    quota is exhausted (system_error in conversation or known quota message).
+    restore_at is the ISO timestamp when the quota will reset (may be empty).
+    """
+    def __init__(self, message: str, restore_at: str = ""):
+        super().__init__(message)
+        self.restore_at = restore_at
+
 import base64
+import http.client
 import io
 import json
 import re
+import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from http.cookiejar import CookieJar
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional
 
@@ -114,6 +135,14 @@ class ConversationBackendClient:
         self.session_id = _new_uuid()
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
+        # Persist cookies across bootstrap / API / estuary (matches browser Session behavior).
+        self._cookie_jar = CookieJar()
+        handlers = [urllib.request.HTTPCookieProcessor(self._cookie_jar)]
+        if proxy_url:
+            handlers.append(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            )
+        self._opener = urllib.request.build_opener(*handlers)
 
     def _request_headers(self, path: str, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers = {
@@ -167,13 +196,7 @@ class ConversationBackendClient:
 
         auth_val = headers.get("Authorization", "")
         print(f"[img-debug] HTTP {method} {url} auth={auth_val[:40]}...", flush=True)
-
-        if self.proxy_url:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
-            )
-            return opener.open(req, timeout=timeout)
-        return urllib.request.urlopen(req, timeout=timeout)
+        return self._opener.open(req, timeout=timeout)
 
     def _do_json_request(self, path: str, body: dict | None = None, method: str = "GET",
                          extra_headers: dict[str, str] | None = None, timeout: int = 60) -> dict:
@@ -208,13 +231,7 @@ class ConversationBackendClient:
         for key, value in self._bootstrap_headers().items():
             req.add_header(key, value)
         try:
-            if self.proxy_url:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
-                )
-                response = opener.open(req, timeout=30)
-            else:
-                response = urllib.request.urlopen(req, timeout=30)
+            response = self._opener.open(req, timeout=30)
         except urllib.error.HTTPError as e:
             body = ""
             try:
@@ -270,7 +287,7 @@ class ConversationBackendClient:
         )
 
     def _conversation_headers(self, path: str, requirements: ChatRequirements,
-                              accept: str = "text/event-stream") -> dict[str, str]:
+                              accept: str = "text/event-stream", conduit_token: str = "") -> dict[str, str]:
         extra = {
             "Accept": accept,
             "Content-Type": "application/json",
@@ -284,6 +301,8 @@ class ConversationBackendClient:
             extra["OpenAI-Sentinel-SO-Token"] = requirements.so_token
         if accept == "text/event-stream":
             extra["X-Oai-Turn-Trace-Id"] = _new_uuid()
+        if conduit_token:
+            extra["X-Conduit-Token"] = conduit_token
         return self._request_headers(path, extra)
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements,
@@ -440,13 +459,158 @@ class ConversationBackendClient:
             "force_parallel_switch": "auto",
         }
         path = "/backend-api/f/conversation"
-        headers = self._conversation_headers(path, requirements, "text/event-stream")
+        headers = self._conversation_headers(path, requirements, "text/event-stream", conduit_token)
         url = self.BASE_URL + path
         data_bytes = json.dumps(payload).encode()
-        response = self._do_request(url, headers, data=data_bytes, method="POST", timeout=300)
+        # Per-chunk read uses this socket timeout; keep moderate vs max_wall_seconds so we
+        # re-check the SSE deadline between reads (300s masked a 240s wall clock).
+        response = self._do_request(url, headers, data=data_bytes, method="POST", timeout=75)
         status = getattr(response, "status", 200)
         _ensure_ok(status, path)
-        return status, _iter_sse_lines(response)
+        return status, response
+
+    def _consume_sse_for_image_metadata(self, response, *, max_wall_seconds: float = 240.0):
+        """Read SSE until we have conversation_id + file refs, EOF, or wall-clock deadline.
+
+        Key signals parsed from upstream events (same as chatgpt2api):
+        - server_ste_metadata.tool_invoked=false  → ChatGPT did NOT call image tool → reject fast
+        - server_ste_metadata.turn_use_case='text' → text-only reply → reject fast
+        - moderation.blocked=true                 → content blocked → reject fast
+        - file-service:// / sediment://           → image asset ready → success
+
+        Returns (conversation_id, file_ids, sediment_ids, tool_invoked, turn_use_case, blocked).
+        """
+        conversation_id = ""
+        file_ids: list[str] = []
+        sediment_ids: list[str] = []
+        # SSE metadata signals (chatgpt2api: server_ste_metadata)
+        tool_invoked: bool | None = None  # None = unknown, False = no tool called
+        turn_use_case: str = ""           # "text" = text-only reply
+        blocked: bool = False
+        deadline = time.monotonic() + max(30.0, max_wall_seconds)
+        buffer = b""
+        file_service_pat = re.compile(r"file-service://([A-Za-z0-9_-]+)")
+        cid_at: float | None = None
+        _debug_post_meta_count = 0   # count payloads after server_ste_metadata for debug
+        _debug_saw_meta = False
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    chunk = response.read(4096)
+                except urllib.error.URLError as exc:
+                    if isinstance(getattr(exc, "reason", None), socket.timeout):
+                        print(
+                            "[img-debug] SSE: read timed out — stopping stream"
+                            + (" (will poll)" if conversation_id else ""),
+                            flush=True,
+                        )
+                        break
+                    raise
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    decoded = line.decode("utf-8", errors="replace").strip()
+                    if not decoded.startswith("data:"):
+                        continue
+                    payload_str = decoded[5:].strip()
+                    if not payload_str or payload_str == "[DONE]":
+                        continue
+
+                    # Extract conversation_id via regex (works even before JSON parse)
+                    cid_match = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', payload_str)
+                    if cid_match and not conversation_id:
+                        conversation_id = cid_match.group(1)
+                        cid_at = time.monotonic()
+
+                    # Extract file-service:// / sediment:// asset refs (only from image_gen tool)
+                    # Only count refs inside image tool messages — check for async_task_type:image_gen
+                    is_image_tool = '"async_task_type":"image_gen"' in payload_str or '"async_task_type": "image_gen"' in payload_str
+                    if is_image_tool:
+                        for fid in file_service_pat.findall(payload_str):
+                            if fid not in file_ids and fid != "file_upload":
+                                file_ids.append(fid)
+                        for s in re.findall(r"sediment://([A-Za-z0-9_-]+)", payload_str):
+                            if s not in sediment_ids:
+                                sediment_ids.append(s)
+
+                    # Also scan full payload for asset refs (matches chatgpt2api extract_conversation_ids)
+                    for fid in file_service_pat.findall(payload_str):
+                        if fid not in file_ids and fid != "file_upload":
+                            file_ids.append(fid)
+                    for s in re.findall(r"sediment://([A-Za-z0-9_-]+)", payload_str):
+                        if s not in sediment_ids:
+                            sediment_ids.append(s)
+
+                    # Parse JSON to extract upstream metadata signals
+                    try:
+                        event = json.loads(payload_str)
+                    except Exception:
+                        event = None
+
+                    if isinstance(event, dict):
+                        etype = str(event.get("type") or "")
+
+                        # server_ste_metadata → tells us if image tool was invoked
+                        if etype == "server_ste_metadata":
+                            meta = event.get("metadata") or {}
+                            if isinstance(meta.get("tool_invoked"), bool):
+                                tool_invoked = meta["tool_invoked"]
+                            turn_use_case = str(meta.get("turn_use_case") or turn_use_case)
+                            print(
+                                f"[img-debug] SSE server_ste_metadata: tool_invoked={tool_invoked} turn_use_case={turn_use_case!r}",
+                                flush=True,
+                            )
+                            _debug_saw_meta = True
+                            # Fast-fail: ChatGPT chose not to generate an image
+                            if tool_invoked is False or turn_use_case == "text":
+                                print(
+                                    "[img-debug] SSE: tool_invoked=false or text reply — account has no image quota, skipping",
+                                    flush=True,
+                                )
+                                return conversation_id, [], [], tool_invoked, turn_use_case, blocked
+
+                        # moderation blocked
+                        if etype == "moderation":
+                            mod = event.get("moderation_response") or {}
+                            if isinstance(mod, dict) and mod.get("blocked") is True:
+                                blocked = True
+                                print("[img-debug] SSE: content blocked by moderation", flush=True)
+                                return conversation_id, [], [], tool_invoked, turn_use_case, blocked
+
+                    # Debug: print first 5 payloads after server_ste_metadata
+                    if _debug_saw_meta and _debug_post_meta_count < 5:
+                        _debug_post_meta_count += 1
+                        print(f"[img-debug] SSE post-meta[{_debug_post_meta_count}] len={len(payload_str)} preview={payload_str[:300]!r}", flush=True)
+
+                    if conversation_id and (file_ids or sediment_ids):
+                        return conversation_id, file_ids, sediment_ids, tool_invoked, turn_use_case, blocked
+
+                # If we have conversation_id but no assets for 30s → go poll
+                if (
+                    cid_at is not None
+                    and conversation_id
+                    and not file_ids
+                    and not sediment_ids
+                    and time.monotonic() - cid_at > 30.0
+                ):
+                    print(
+                        "[img-debug] SSE: have conversation_id, no asset refs after 30s — closing stream, will poll",
+                        flush=True,
+                    )
+                    return conversation_id, file_ids, sediment_ids, tool_invoked, turn_use_case, blocked
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+        print(
+            f"[img-debug] SSE done: cid={conversation_id!r} file_ids={file_ids} sediment_ids={sediment_ids}"
+            f" tool_invoked={tool_invoked} turn_use_case={turn_use_case!r}",
+            flush=True,
+        )
+        return conversation_id, file_ids, sediment_ids, tool_invoked, turn_use_case, blocked
 
     def _get_conversation(self, conversation_id: str) -> dict:
         path = f"/backend-api/conversation/{conversation_id}"
@@ -464,7 +628,12 @@ class ConversationBackendClient:
             content = message.get("content") or {}
             if author.get("role") != "tool":
                 continue
-            if metadata.get("async_task_type") != "image_gen":
+            atype = metadata.get("async_task_type")
+            if (
+                atype is not None
+                and str(atype).strip()
+                and str(atype).strip() != "image_gen"
+            ):
                 continue
             file_ids, sediment_ids = [], []
             for part in content.get("parts") or []:
@@ -474,10 +643,63 @@ class ConversationBackendClient:
             records.append({"message_id": message_id, "file_ids": file_ids, "sediment_ids": sediment_ids})
         return records
 
-    def _poll_image_results(self, conversation_id: str, timeout_secs: float = 120.0) -> tuple[list[str], list[str]]:
+    @staticmethod
+    def _fallback_asset_ids_from_conversation_blob(conv: dict) -> tuple[list[str], list[str]]:
+        """Last resort: scan serialized conversation for asset URLs (mapping shape may vary)."""
+        raw = json.dumps(conv or {}, ensure_ascii=False)
+        file_pat = re.compile(r"file-service://([A-Za-z0-9_-]+)")
+        sed_pat = re.compile(r"sediment://([A-Za-z0-9_-]+)")
+        fids, sids = [], []
+        for m in file_pat.findall(raw):
+            if m != "file_upload" and m not in fids:
+                fids.append(m)
+        for m in sed_pat.findall(raw):
+            if m not in sids:
+                sids.append(m)
+        return fids, sids
+
+    @staticmethod
+    @staticmethod
+    def _check_conversation_quota_error(conv: dict) -> tuple[str, str]:
+        """Return (error_msg, restore_at) if conversation indicates quota exhausted.
+        Returns ("", "") if no quota error detected.
+        """
+        mapping = conv.get("mapping") or {}
+        restore_at = ""
+        for node in mapping.values():
+            msg = (node or {}).get("message") or {}
+            author = (msg.get("author") or {}).get("role", "")
+            content = msg.get("content") or {}
+            ctype = content.get("content_type", "")
+            # tool message with system_error = quota or backend error
+            if author == "tool" and ctype == "system_error":
+                return "image generation failed: upstream system_error (quota exhausted or backend error)", restore_at
+            # assistant text containing known quota messages
+            if author == "assistant" and ctype == "text":
+                for part in content.get("parts") or []:
+                    text = str(part) if isinstance(part, str) else ""
+                    lower = text.lower()
+                    if any(kw in lower for kw in (
+                        "free plan limit", "hit the free", "limit resets",
+                        "image generation limit", "upgrade to", "can't generate",
+                        "plan limit for image",
+                    )):
+                        # Try to extract restore time from message like "resets in 20 hours"
+                        msg_preview = text[:200]
+                        return f"image generation quota exhausted: {msg_preview}", restore_at
+        return "", ""
+
+    def _poll_image_results(self, conversation_id: str, timeout_secs: float = 300.0) -> tuple[list[str], list[str]]:
         start = time.time()
+        attempt = 0
         while time.time() - start < timeout_secs:
+            attempt += 1
             conv = self._get_conversation(conversation_id)
+            # Fast-fail if conversation shows quota exhausted or content blocked
+            quota_err, restore_at = self._check_conversation_quota_error(conv)
+            if quota_err:
+                print(f"[img-debug] poll: quota/error detected → {quota_err[:120]}", flush=True)
+                raise ImageQuotaExhaustedError(quota_err, restore_at=restore_at)
             file_ids, sediment_ids = [], []
             for record in self._extract_image_tool_records(conv):
                 file_ids.extend(f for f in record["file_ids"] if f not in file_ids)
@@ -486,7 +708,43 @@ class ConversationBackendClient:
                 return file_ids, sediment_ids
             if sediment_ids:
                 return [], sediment_ids
-            time.sleep(4)
+            fb_f, fb_s = self._fallback_asset_ids_from_conversation_blob(conv)
+            for f in fb_f:
+                if f not in file_ids:
+                    file_ids.append(f)
+            for s in fb_s:
+                if s not in sediment_ids:
+                    sediment_ids.append(s)
+            if file_ids:
+                return file_ids, sediment_ids
+            if sediment_ids:
+                return [], sediment_ids
+            # Debug: dump conversation mapping every time node count changes
+            mapping = conv.get("mapping") or {}
+            n_nodes = len(mapping)
+            if not hasattr(self, '_last_poll_nodes'):
+                self._last_poll_nodes = {}
+            prev_nodes = self._last_poll_nodes.get(conversation_id, -1)
+            if n_nodes != prev_nodes:
+                self._last_poll_nodes[conversation_id] = n_nodes
+                elapsed = round(time.time() - start)
+                print(f"[img-debug] poll t+{elapsed}s attempt={attempt} cid={conversation_id[:8]}… nodes={n_nodes}", flush=True)
+                for mid, node in list(mapping.items())[:12]:
+                    msg = (node or {}).get("message") or {}
+                    author = (msg.get("author") or {}).get("role", "?")
+                    atype = (msg.get("metadata") or {}).get("async_task_type", "-")
+                    ctype = (msg.get("content") or {}).get("content_type", "-")
+                    parts = (msg.get("content") or {}).get("parts") or []
+                    part_preview = str(parts[0])[:180] if parts else "-"
+                    print(f"[img-debug]   role={author!r} atype={atype!r} ctype={ctype!r} p0={part_preview!r}", flush=True)
+            # Dynamic sleep: short at start, slower later
+            elapsed = time.time() - start
+            if elapsed < 120:
+                time.sleep(4)
+            elif elapsed < 300:
+                time.sleep(8)
+            else:
+                time.sleep(15)
         return [], []
 
     def _get_file_download_url(self, file_id: str) -> str:
@@ -535,13 +793,36 @@ class ConversationBackendClient:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = urllib.request.urlopen(url, timeout=120) if not self.proxy_url else (
-                urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": self.proxy_url, "https": self.proxy_url})
-                ).open(url, timeout=120)
-            )
-            images.append(response.read())
-            response.close()
+            short = url[:80]
+            print(f"[img-debug] CDN download start url={short}...", flush=True)
+            last_err: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    req = urllib.request.Request(url)
+                    if url.startswith(self.BASE_URL):
+                        req.add_header("Authorization", f"Bearer {self.access_token}")
+                        req.add_header("User-Agent", _browser_user_agent)
+                        req.add_header("Referer", self.BASE_URL + "/")
+                    resp = self._opener.open(req, timeout=180)
+                    try:
+                        data = resp.read()
+                    finally:
+                        resp.close()
+                    print(f"[img-debug] CDN download OK bytes={len(data)}", flush=True)
+                    images.append(data)
+                    break
+                except http.client.IncompleteRead as exc:
+                    last_err = exc
+                    print(f"[img-debug] CDN download attempt {attempt}/3 incomplete: {exc}", flush=True)
+                    if attempt >= 3:
+                        raise last_err
+                except urllib.error.URLError as exc:
+                    last_err = exc
+                    print(f"[img-debug] CDN download attempt {attempt}/3 URLError: {exc}", flush=True)
+                    if attempt >= 3:
+                        raise last_err
+                except urllib.error.HTTPError:
+                    raise
         return images
 
     def generate_image(self, prompt: str, n: int = 1, size: str | None = None,
@@ -565,26 +846,42 @@ class ConversationBackendClient:
             print(f"[img-debug] step 3/4: prepare start model={model}", flush=True)
             conduit_token = self._prepare_image_conversation(enhanced_prompt, requirements, model)
             print(f"[img-debug] step 3/4: prepare OK conduit_len={len(conduit_token)}", flush=True)
+            if not conduit_token.strip():
+                print("[img-debug] WARNING: empty conduit_token — image request may hang upstream", flush=True)
 
             print(f"[img-debug] step 4/4: start_generation start", flush=True)
-            status, sse_payloads = self._start_image_generation(
+            status, sse_response = self._start_image_generation(
                 enhanced_prompt, requirements, conduit_token, model
             )
             print(f"[img-debug] step 4/4: start_generation OK status={status}", flush=True)
 
-            conversation_id = ""
-            file_ids: list[str] = []
-            sediment_ids: list[str] = []
-
-            for payload in sse_payloads:
-                cid_match = re.search(r'"conversation_id"\s*:\s*"([^"]+)"', payload)
-                if cid_match and not conversation_id:
-                    conversation_id = cid_match.group(1)
-                file_ids.extend(f for f in re.findall(r"(file[-_][A-Za-z0-9]+)", payload) if f not in file_ids)
-                sediment_ids.extend(s for s in re.findall(r"sediment://([A-Za-z0-9_-]+)", payload) if s not in sediment_ids)
+            conversation_id, file_ids, sediment_ids, tool_invoked, turn_use_case, blocked = (
+                self._consume_sse_for_image_metadata(sse_response, max_wall_seconds=60.0)
+            )
+            # Fast-fail: upstream explicitly said no image tool was called
+            if tool_invoked is False or turn_use_case == "text":
+                raise ImageQuotaExhaustedError(
+                    "image generation rejected by upstream (tool_invoked=false or text-only reply); "
+                    "account has no image quota"
+                )
+            if blocked:
+                raise RuntimeError("image generation blocked by content moderation")
+            if conversation_id and (file_ids or sediment_ids):
+                print("[img-debug] SSE: stopped early (conversation_id + asset refs)", flush=True)
+            elif conversation_id:
+                print("[img-debug] SSE: stopped on deadline/EOF; will poll conversation if needed", flush=True)
 
             urls = self.resolve_conversation_image_urls(conversation_id, file_ids, sediment_ids)
             if not urls:
+                if tool_invoked is True:
+                    # Generation was started (tool_invoked=True) but we timed out waiting.
+                    # Don't retry with another account — that would burn another quota slot
+                    # for an image that is still being generated in the background.
+                    raise ImageGenerationStartedError(
+                        f"image generation started (tool_invoked=True) but timed out waiting "
+                        f"for result (conversation_id={conversation_id!r}); "
+                        "retrying with another account would waste its quota"
+                    )
                 raise RuntimeError("image generation produced no downloadable images")
 
             image_bytes_list = self.download_image_bytes(urls)

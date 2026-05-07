@@ -41,7 +41,7 @@ from codex2gpt.protocols.relay import (
 )
 from codex2gpt.schema_utils import prepare_json_schema
 from codex2gpt.state_db import RuntimeStateStore
-from codex2gpt.conversation_backend import ConversationBackendClient, IMAGE_MODELS as CONVERSATION_IMAGE_MODELS
+from codex2gpt.conversation_backend import ConversationBackendClient, ImageGenerationStartedError, ImageQuotaExhaustedError, IMAGE_MODELS as CONVERSATION_IMAGE_MODELS
 from codex2gpt.image_cache import ImageCache
 
 
@@ -885,33 +885,12 @@ class OAuthAccount:
     def _save(self, data):
         write_codex_auth_file(self.auth_file, data)
 
-    @staticmethod
-    def _jwt_is_expired(token: str, buffer_seconds: int = 300) -> bool:
-        """Return True if the JWT is expired or will expire within buffer_seconds."""
-        try:
-            parts = token.split(".")
-            if len(parts) < 2:
-                return True
-            pad = parts[1] + "=" * (-len(parts[1]) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(pad.encode("ascii")).decode("utf-8"))
-            exp = int(payload.get("exp") or 0)
-            return exp == 0 or time.time() > exp - buffer_seconds
-        except Exception:
-            return False
-
     def access_token(self):
         data = self._load()
         token = data.get("tokens", {}).get("access_token", "").strip()
-        if not token:
-            return self.refresh_access_token()
-        if not self._jwt_is_expired(token):
+        if token:
             return token
-        # JWT expired — try to refresh; if refresh fails, fall back to stale token
-        # so the upstream can give us a definitive 401 rather than failing here silently.
-        try:
-            return self.refresh_access_token()
-        except Exception:
-            return token
+        return self.refresh_access_token()
 
     def refresh_access_token(self):
         with self.lock:
@@ -959,6 +938,19 @@ class OAuthAccount:
             data["last_refresh"] = normalize_last_refresh(time.time())
             self._save(data)
             return tokens["access_token"]
+
+
+def _bg_refresh_account(account):
+    """Silently refresh an account's token in the background after a 401."""
+    try:
+        account.refresh_access_token()
+        print(f"[bg-refresh] {account.name} token refreshed OK", flush=True)
+    except Exception as exc:
+        print(f"[bg-refresh] {account.name} refresh failed: {exc}", flush=True)
+        if is_refresh_token_invalid_error(exc):
+            # Permanently broken — mark expired so it is skipped in future candidates
+            set_account_status(account.name, "expired", last_error=str(exc))
+            print(f"[bg-refresh] {account.name} marked expired (refresh token invalid)", flush=True)
 
 
 class AccountPool:
@@ -1111,10 +1103,29 @@ class AccountPool:
             return ordered
         return []
 
+    def _filter_image_quota_exhausted_locked(self, ordered, model_name):
+        """For image models, skip accounts whose image quota is known to be exhausted."""
+        if not is_image_model(model_name):
+            return ordered
+        now = time.time()
+        account_rows = {row["entry_id"]: row for row in STATE_DB.list_accounts()}
+        available = []
+        for account in ordered:
+            quota = (account_rows.get(account.name) or {}).get("quota") or {}
+            exhausted_until = quota.get("image_gen_exhausted_until")
+            if exhausted_until and float(exhausted_until) > now:
+                continue
+            available.append(account)
+        # Do NOT fall back to exhausted accounts — return empty so callers
+        # can give a clear "quota exhausted, try again later" error instead of
+        # cycling through broken/expired accounts.
+        return available
+
     def candidates(self, session_key: str = "", model_name: str = ""):
         with self.lock:
             self._prune_sticky_sessions_locked()
             ordered = self._filter_accounts_for_model_locked(self._base_order_locked(), model_name)
+            ordered = self._filter_image_quota_exhausted_locked(ordered, model_name)
             if not ordered:
                 return []
             session_key = session_key.strip()
@@ -1732,6 +1743,55 @@ def record_image_usage(account_name):
     )
 
 
+def mark_image_quota_exhausted(account_name: str, restore_at: str = "", error_msg: str = "") -> None:
+    """Put a cooldown on an account's image generation until restore_at.
+    If restore_at is unknown, defaults to the next UTC midnight (ChatGPT resets daily at UTC 00:00).
+    """
+    if not account_name:
+        return
+    # Figure out cooldown duration from restore_at or next UTC midnight
+    cooldown_secs = 3600  # fallback minimum
+    if restore_at:
+        try:
+            restore = datetime.datetime.fromisoformat(restore_at.replace("Z", "+00:00"))
+            if restore.tzinfo is None:
+                restore = restore.replace(tzinfo=datetime.timezone.utc)
+            delta = (restore - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+            cooldown_secs = max(60, int(delta))
+        except Exception:
+            pass
+    else:
+        # Default: next UTC midnight (ChatGPT free resets daily at UTC 00:00)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        next_midnight = (now_utc + datetime.timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        cooldown_secs = max(60, int((next_midnight - now_utc).total_seconds()))
+    existing = STATE_DB.get_account(account_name) or {}
+    quota = dict(existing.get("quota") or {})
+    quota["image_gen_remaining"] = 0
+    quota["image_gen_exhausted_until"] = time.time() + cooldown_secs
+    if restore_at:
+        quota["image_gen_restore_at"] = restore_at
+    STATE_DB.upsert_account(
+        account_name,
+        auth_file=existing.get("auth_file"),
+        email=existing.get("email"),
+        user_id=existing.get("user_id"),
+        account_id=existing.get("account_id"),
+        plan_type=existing.get("plan_type"),
+        status=existing.get("status") or "active",
+        refresh_token=existing.get("refresh_token"),
+        proxy_id=existing.get("proxy_id"),
+        last_error=error_msg or existing.get("last_error"),
+        metadata=existing.get("metadata") or {},
+        quota=quota,
+        usage=existing.get("usage") or {},
+        auth_payload=existing.get("auth_payload") or {},
+    )
+    print(f"[img] marked {account_name} image quota exhausted for {cooldown_secs//3600}h", flush=True)
+
+
 def set_account_status(account_name, status, *, last_error=None):
     if not account_name:
         return
@@ -2192,10 +2252,14 @@ def extract_image_gen_quota(raw_init):
         if not isinstance(entry, dict):
             continue
         if entry.get("feature_name") == "image_gen":
+            raw_remaining = entry.get("remaining")
+            raw_limit = entry.get("limit")
             return {
-                "image_gen_remaining": int(entry.get("remaining") or 0),
+                # None means "not reported by API" (different from 0 = "none left")
+                "image_gen_remaining": int(raw_remaining) if raw_remaining is not None else None,
                 "image_gen_restore_at": entry.get("reset_after") or "",
-                "image_gen_limit": int(entry.get("limit") or 0),
+                # limit=null/0 for free plans means no paid credits, not "hard cap 0"
+                "image_gen_limit": int(raw_limit) if raw_limit is not None else None,
             }
     return {"image_gen_remaining": None, "image_gen_restore_at": "", "image_gen_limit": None}
 
@@ -2321,6 +2385,15 @@ def refresh_account_quota(account):
 
     existing = STATE_DB.get_account(account.name) or {}
     auth_payload = read_json_file(account.auth_file, {})
+
+    # Preserve image_gen_exhausted_until if still in the future (not cleared by API refresh)
+    existing_quota = existing.get("quota") or {}
+    exhausted_until = existing_quota.get("image_gen_exhausted_until")
+    if exhausted_until and float(exhausted_until) > time.time():
+        summary["image_gen_exhausted_until"] = exhausted_until
+        # Keep the corrected remaining=0 instead of the misleading API value
+        summary["image_gen_remaining"] = 0
+
     update_account_record(
         account.name,
         email=summary.get("email") or existing.get("email"),
@@ -4914,6 +4987,12 @@ def summarize_usage_tokens(usage):
 def is_retryable_error(error):
     if isinstance(error, urllib.error.HTTPError):
         return error.code in RETRYABLE_STATUS_CODES
+    if isinstance(error, RuntimeError):
+        message = str(error).lower()
+        # Token refresh failures should fail over to the next account
+        # instead of aborting the whole request.
+        if "refresh failed (401)" in message or "refresh token has already been used" in message:
+            return True
     return isinstance(error, urllib.error.URLError)
 
 
@@ -4937,6 +5016,13 @@ def is_account_unusable_error(error):
         return False
     detail = payload.get("detail")
     return isinstance(detail, dict) and str(detail.get("code", "")).strip() == "deactivated_workspace"
+
+
+def is_refresh_token_invalid_error(error):
+    if not isinstance(error, RuntimeError):
+        return False
+    message = str(error).lower()
+    return "refresh failed (401)" in message or "refresh token has already been used" in message
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -6671,22 +6757,7 @@ class Handler(BaseHTTPRequestHandler):
                                 account_name=account.name,
                             )
                             print(f"[image-gen] account={account.name} prompt={prompt_text[:80]}...", flush=True)
-                            try:
-                                result = client.generate_image_b64(prompt_text, n=1, model=requested_model_name)
-                            except urllib.error.HTTPError as http_exc:
-                                if http_exc.code in {401, 403}:
-                                    try:
-                                        new_token = account.refresh_access_token()
-                                        client2 = ConversationBackendClient(
-                                            access_token=new_token,
-                                            proxy_url=proxy_url,
-                                            account_name=account.name,
-                                        )
-                                        result = client2.generate_image_b64(prompt_text, n=1, model=requested_model_name)
-                                    except Exception:
-                                        raise http_exc
-                                else:
-                                    raise
+                            result = client.generate_image_b64(prompt_text, n=1, model=requested_model_name)
                             pool.mark_success(account.name)
                             record_image_usage(account.name)
                             content_text = ""
@@ -6733,16 +6804,24 @@ class Handler(BaseHTTPRequestHandler):
                                 }),
                             )
                             return
+                        except ImageQuotaExhaustedError as exc:
+                            last_error = exc
+                            mark_image_quota_exhausted(account.name, restore_at=exc.restore_at, error_msg=str(exc))
+                            pool.mark_failure(account.name, exc)
+                            continue
+                        except ImageGenerationStartedError as exc:
+                            last_error = exc
+                            print(f"[image-gen] ImageGenerationStartedError — stopping retry: {exc}", flush=True)
+                            break
                         except Exception as exc:
                             last_error = exc
                             print(f"[image-gen] FAILED account={account.name} error={exc}", flush=True)
                             if isinstance(exc, urllib.error.HTTPError):
                                 if exc.code == 401:
-                                    set_account_status(account.name, "expired", last_error=str(exc))
-                                elif exc.code == 403:
-                                    set_account_status(account.name, "banned", last_error=str(exc))
+                                    threading.Thread(target=_bg_refresh_account, args=(account,), daemon=True).start()
                                 elif exc.code == 429:
                                     set_account_status(account.name, "rate_limited", last_error=str(exc))
+                                # 403 in image gen = quota exhausted, not banned
                             pool.mark_failure(account.name, exc)
                             continue
                     self._write_json(502, {"error": {"type": "upstream_error", "message": str(last_error or "all accounts failed")}})
@@ -6878,11 +6957,35 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 accounts = pool.candidates("", model)
                 if not accounts:
-                    self._write_json(429, {"error": {"type": "rate_limit_error", "message": "no available accounts"}})
+                    # Compute the earliest restore time across all accounts
+                    restore_hint = ""
+                    try:
+                        import sqlite3 as _sqlite3, json as _json
+                        _db = _sqlite3.connect("runtime/state.sqlite3")
+                        _db.row_factory = _sqlite3.Row
+                        _now = time.time()
+                        _earliest = None
+                        for _row in _db.execute("SELECT quota_json FROM accounts WHERE status NOT IN ('expired','banned')"):
+                            _q = _json.loads(_row["quota_json"] or "{}")
+                            _until = _q.get("image_gen_exhausted_until")
+                            if _until and float(_until) > _now:
+                                if _earliest is None or float(_until) < _earliest:
+                                    _earliest = float(_until)
+                        _db.close()
+                        if _earliest:
+                            import datetime as _dt
+                            _restore_utc = _dt.datetime.fromtimestamp(_earliest, tz=_dt.timezone.utc)
+                            restore_hint = f" Quota resets around {_restore_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}."
+                    except Exception:
+                        pass
+                    self._write_json(429, {"error": {"type": "rate_limit_error", "message": f"all accounts have exhausted their daily image generation quota.{restore_hint} Please try again later."}})
                     return
+                print(f"[img] candidates={[a.name for a in accounts]}", flush=True)
                 last_error = None
+                result = None
                 for account in accounts:
                     try:
+                        print(f"[img] trying account={account.name}", flush=True)
                         proxy_url = resolve_proxy_url_for_account(account.name)
                         token = account.access_token()
                         client = ConversationBackendClient(
@@ -6890,44 +6993,48 @@ class Handler(BaseHTTPRequestHandler):
                             proxy_url=proxy_url,
                             account_name=account.name,
                         )
-                        try:
-                            result = client.generate_image_b64(prompt, n=n, size=size, model=model)
-                        except urllib.error.HTTPError as http_exc:
-                            if http_exc.code in {401, 403}:
-                                # Token rejected by upstream — refresh and retry once.
-                                # On any failure, re-raise the original HTTPError so the outer
-                                # handler can apply the correct cooldown and status.
-                                try:
-                                    new_token = account.refresh_access_token()
-                                    client2 = ConversationBackendClient(
-                                        access_token=new_token,
-                                        proxy_url=proxy_url,
-                                        account_name=account.name,
-                                    )
-                                    result = client2.generate_image_b64(prompt, n=n, size=size, model=model)
-                                except Exception:
-                                    raise http_exc
-                            else:
-                                raise
+                        result = client.generate_image_b64(prompt, n=n, size=size, model=model)
                         pool.mark_success(account.name)
                         record_image_usage(account.name)
-                        self._write_json(200, result)
-                        self._record_completed_transcript(
-                            path, {}, model, {"input": [{"role": "user", "content": prompt}]}, raw_payload,
-                            {"response_id": "", "output_text": "Image generated", "tool_calls": [], "usage": {}, "response_payload": result},
-                        )
-                        return
+                        # Write response OUTSIDE the retry loop so a broken-pipe /
+                        # client-disconnect does not cause the loop to try more accounts.
+                        break
+                    except ImageQuotaExhaustedError as exc:
+                        # Account has no image quota or it's exhausted — mark and try next account
+                        last_error = exc
+                        mark_image_quota_exhausted(account.name, restore_at=exc.restore_at, error_msg=str(exc))
+                        pool.mark_failure(account.name, exc)
+                        result = None
+                        continue
+                    except ImageGenerationStartedError as exc:
+                        # Generation was started but we timed out waiting.
+                        # Do NOT retry with another account — that would waste its quota.
+                        last_error = exc
+                        print(f"[img] ImageGenerationStartedError — stopping retry loop: {exc}", flush=True)
+                        break
                     except Exception as exc:
                         last_error = exc
-                        if isinstance(exc, urllib.error.HTTPError):
+                        if is_refresh_token_invalid_error(exc):
+                            # Broken refresh token — immediately mark expired so future
+                            # requests skip this account without retrying.
+                            set_account_status(account.name, "expired", last_error=str(exc))
+                            print(f"[img] account={account.name} marked expired (refresh token invalid)", flush=True)
+                        elif isinstance(exc, urllib.error.HTTPError):
                             if exc.code == 401:
-                                set_account_status(account.name, "expired", last_error=str(exc))
-                            elif exc.code == 403:
-                                set_account_status(account.name, "banned", last_error=str(exc))
+                                threading.Thread(target=_bg_refresh_account, args=(account,), daemon=True).start()
                             elif exc.code == 429:
                                 set_account_status(account.name, "rate_limited", last_error=str(exc))
+                            # 403 in image gen = quota exhausted, not banned; just apply cooldown
                         pool.mark_failure(account.name, exc)
+                        result = None
                         continue
+                if result is not None:
+                    self._write_json(200, result)
+                    self._record_completed_transcript(
+                        path, {}, model, {"input": [{"role": "user", "content": prompt}]}, raw_payload,
+                        {"response_id": "", "output_text": "Image generated", "tool_calls": [], "usage": {}, "response_payload": result},
+                    )
+                    return
                 self._write_json(502, {"error": {"type": "upstream_error", "message": str(last_error or "all accounts failed")}})
                 self._record_failed_transcript(
                     path, {}, model, {"input": [{"role": "user", "content": prompt}]}, raw_payload,
@@ -7028,6 +7135,18 @@ class Handler(BaseHTTPRequestHandler):
                             "output": output_items,
                         })
                         return
+                    except ImageQuotaExhaustedError as exc:
+                        last_error = exc
+                        mark_image_quota_exhausted(
+                            getattr(account, "name", str(account)),
+                            restore_at=exc.restore_at, error_msg=str(exc),
+                        )
+                        pool.mark_failure(account)
+                        continue
+                    except ImageGenerationStartedError as exc:
+                        last_error = exc
+                        print(f"[image-gen] ImageGenerationStartedError — stopping retry: {exc}", flush=True)
+                        break
                     except Exception as exc:
                         last_error = exc
                         pool.mark_failure(account)
@@ -7220,6 +7339,8 @@ class Handler(BaseHTTPRequestHandler):
                         set_account_status(account.name, "rate_limited", last_error=str(exc))
                     else:
                         set_account_status(account.name, "error", last_error=str(exc))
+                elif is_refresh_token_invalid_error(exc):
+                    set_account_status(account.name, "expired", last_error=str(exc))
                 else:
                     set_account_status(account.name, "error", last_error=str(exc))
                 if not is_account_unusable_error(exc):
